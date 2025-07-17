@@ -10,11 +10,12 @@ def upload_video():
     title = data.get("title", "Untitled Video")
     description = data.get("description", "")
     privacy = data.get("privacy", "unlisted")
+    bunny_delete_url = data.get("bunny_delete_url")
 
     if not video_url:
         return jsonify({"error": "Missing video_url"}), 400
 
-    youtube_url = upload_to_youtube(video_url, title, description, privacy)
+    youtube_url = upload_to_youtube(video_url, title, description, privacy, bunny_delete_url)
 
     return jsonify({"youtube_url": youtube_url}), 200
 
