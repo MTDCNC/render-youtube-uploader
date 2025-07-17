@@ -19,21 +19,19 @@ def get_authenticated_service():
     creds.refresh(google.auth.transport.requests.Request())
     return build('youtube', 'v3', credentials=creds)
 
-def upload_to_youtube(video_url, title, description, privacy):
-    # Clean up any leftover temp files
+def upload_to_youtube(video_url, title, description, privacy, bunny_delete_url=None):
     if os.path.exists("temp_video.mp4"):
         os.remove("temp_video.mp4")
-        print("🗑️ Previous temp_video.mp4 deleted to free up space.")
-        
-    temp_file = "temp_video.mp4"
+        print("🗑️ Previous temp_video.mp4 deleted.")
 
-    print(f"⬇️ Downloading {video_url} to disk...")
+    temp_file = "temp_video.mp4"
+    print(f"⬇️ Downloading from {video_url}...")
     with requests.get(video_url, stream=True) as response:
         response.raise_for_status()
-        with open(temp_file, "wb") as out_file:
+        with open(temp_file, "wb") as f:
             for chunk in response.iter_content(chunk_size=1048576):
-                out_file.write(chunk)
-    print(f"✅ Download complete, starting YouTube upload.")
+                f.write(chunk)
+    print(f"✅ Download complete.")
 
     youtube = get_authenticated_service()
 
@@ -53,8 +51,18 @@ def upload_to_youtube(video_url, title, description, privacy):
 
     print(f"✅ Upload complete! YouTube video ID: {response['id']}")
 
-    # Cleanup
     os.remove(temp_file)
-    print(f"🗑️ Deleted local file {temp_file}.")
+    print(f"🗑️ Local file {temp_file} deleted.")
+
+    if bunny_delete_url:
+        print(f"🗑️ Deleting from Bunny Storage: {bunny_delete_url}")
+        delete_response = requests.delete(
+            bunny_delete_url,
+            headers={'AccessKey': os.environ['BUNNY_API_KEY']}
+        )
+        if delete_response.status_code == 200:
+            print("✅ Bunny file deleted.")
+        else:
+            print(f"⚠️ Failed to delete Bunny file: {delete_response.status_code}, {delete_response.text}")
 
     return f"https://youtu.be/{response['id']}"
