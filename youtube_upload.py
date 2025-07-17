@@ -19,7 +19,7 @@ def get_authenticated_service():
     creds.refresh(google.auth.transport.requests.Request())
     return build('youtube', 'v3', credentials=creds)
 
-def upload_to_youtube(video_url, title, description, privacy, bunny_delete_url=None, thumbnail_url=None):
+def upload_to_youtube(video_url, title, description, privacy, bunny_delete_url=None, thumbnail_url=None, made_for_kids=False):
     # ✅ Pre-upload cleanup
     if os.path.exists("temp_video.mp4"):
         os.remove("temp_video.mp4")
