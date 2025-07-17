@@ -20,6 +20,11 @@ def get_authenticated_service():
     return build('youtube', 'v3', credentials=creds)
 
 def upload_to_youtube(video_url, title, description, privacy):
+    # Clean up any leftover temp files
+    if os.path.exists("temp_video.mp4"):
+        os.remove("temp_video.mp4")
+        print("🗑️ Previous temp_video.mp4 deleted to free up space.")
+        
     temp_file = "temp_video.mp4"
 
     print(f"⬇️ Downloading {video_url} to disk...")
