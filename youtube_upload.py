@@ -38,7 +38,7 @@ def upload_to_youtube(video_url, title, description, privacy, bunny_delete_url=N
 
     body = {
         'snippet': {'title': title, 'description': description},
-        'status': {'privacyStatus': privacy,'madeForKids': False
+        'status': {'privacyStatus': privacy,'madeForKids': False }
     }
 
     media = MediaFileUpload(temp_file, mimetype='video/*', resumable=True)
