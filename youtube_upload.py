@@ -1,3 +1,5 @@
+# ✅ FINAL youtube_upload.py
+
 import os
 import requests
 import google.auth.transport.requests
@@ -6,6 +8,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
+
 
 def get_authenticated_service():
     creds = Credentials(
@@ -19,8 +22,8 @@ def get_authenticated_service():
     creds.refresh(google.auth.transport.requests.Request())
     return build('youtube', 'v3', credentials=creds)
 
-def upload_to_youtube(video_url, title, description, privacy, bunny_delete_url=None, thumbnail_url=None, made_for_kids=False):
-    # ✅ Pre-upload cleanup
+
+def upload_to_youtube(video_url, title, description, privacy, bunny_delete_url=None, thumbnail_url=None):
     if os.path.exists("temp_video.mp4"):
         os.remove("temp_video.mp4")
         print("🗑️ Previous temp_video.mp4 deleted.")
@@ -38,7 +41,7 @@ def upload_to_youtube(video_url, title, description, privacy, bunny_delete_url=N
 
     body = {
         'snippet': {'title': title, 'description': description},
-        'status': {'privacyStatus': privacy,'madeForKids': False }
+        'status': {'privacyStatus': privacy, 'madeForKids': False}
     }
 
     media = MediaFileUpload(temp_file, mimetype='video/*', resumable=True)
@@ -53,40 +56,42 @@ def upload_to_youtube(video_url, title, description, privacy, bunny_delete_url=N
     video_id = response['id']
     print(f"✅ Upload complete! YouTube video ID: {video_id}")
 
-    # ✅ Optional Thumbnail Upload
+    # ✅ Optional Thumbnail
     if thumbnail_url:
-        print(f"⬇️ Downloading thumbnail from {thumbnail_url}...")
-        thumb_file = "temp_thumbnail.jpg"
-        with requests.get(thumbnail_url, stream=True) as thumb_response:
-            thumb_response.raise_for_status()
-            with open(thumb_file, "wb") as f:
-                for chunk in thumb_response.iter_content(chunk_size=1024):
-                    f.write(chunk)
-        print("✅ Thumbnail downloaded. Uploading to YouTube...")
+        try:
+            print(f"⬇️ Downloading thumbnail from {thumbnail_url}...")
+            thumb_file = "temp_thumbnail.jpg"
+            with requests.get(thumbnail_url, stream=True) as thumb_response:
+                thumb_response.raise_for_status()
+                with open(thumb_file, "wb") as f:
+                    for chunk in thumb_response.iter_content(chunk_size=1024):
+                        f.write(chunk)
+            print("✅ Thumbnail downloaded. Uploading to YouTube...")
+            youtube.thumbnails().set(
+                videoId=video_id,
+                media_body=MediaFileUpload(thumb_file, mimetype='image/jpeg')
+            ).execute()
+            print("✅ Thumbnail uploaded.")
+            os.remove(thumb_file)
+            print("🗑️ Thumbnail file deleted.")
+        except Exception as thumb_err:
+            print(f"⚠️ Thumbnail failed but video uploaded fine: {thumb_err}")
 
-        youtube.thumbnails().set(
-            videoId=video_id,
-            media_body=MediaFileUpload(thumb_file, mimetype='image/jpeg')
-        ).execute()
-        print("✅ Thumbnail uploaded.")
-
-        os.remove(thumb_file)
-        print(f"🗑️ Local thumbnail file deleted.")
-
-    # ✅ Cleanup local video
     os.remove(temp_file)
     print(f"🗑️ Local video file {temp_file} deleted.")
 
-    # ✅ Bunny File Deletion
     if bunny_delete_url:
-        print(f"🗑️ Deleting from Bunny Storage: {bunny_delete_url}")
-        delete_response = requests.delete(
-            bunny_delete_url,
-            headers={'AccessKey': os.environ['BUNNY_API_KEY']}
-        )
-        if delete_response.status_code == 200:
-            print("✅ Bunny file deleted.")
-        else:
-            print(f"⚠️ Bunny delete failed: {delete_response.status_code}, {delete_response.text}")
+        try:
+            print(f"🗑️ Deleting Bunny file at: {bunny_delete_url}")
+            delete_response = requests.delete(
+                bunny_delete_url,
+                headers={'AccessKey': os.environ['BUNNY_API_KEY']}
+            )
+            if delete_response.status_code == 200:
+                print("✅ Bunny file deleted.")
+            else:
+                print(f"⚠️ Bunny delete failed: {delete_response.status_code}, {delete_response.text}")
+        except Exception as bunny_err:
+            print(f"⚠️ Bunny delete encountered an error: {bunny_err}")
 
     return f"https://youtu.be/{video_id}"
