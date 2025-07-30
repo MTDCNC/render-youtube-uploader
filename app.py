@@ -1,10 +1,10 @@
-# ✅ FINAL app.py with async YouTube upload + status-check
+# ✅ FINAL app.py with async YouTube upload + status-check + YouTube fallback
 
 from flask import Flask, request, jsonify
 import json
 import os
 import threading
-from youtube_upload import upload_to_youtube
+from youtube_upload import upload_to_youtube, get_authenticated_service
 
 app = Flask(__name__)
 
@@ -38,6 +38,8 @@ def async_upload(video_url, title, description, privacy, bunny_delete_url=None, 
         save_status(title, youtube_url)
     except Exception as e:
         print(f"❌ Async YouTube upload failed for {title}: {e}")
+        with open("upload_error.log", "a") as log:
+            log.write(f"{title} failed: {str(e)}\n")
 
 
 @app.route("/upload-to-youtube", methods=["POST"])
@@ -62,9 +64,20 @@ def upload_video():
     return jsonify({"status": "processing", "title": title}), 202
 
 
+@app.route("/status-check", methods=["GET"])
+def status_check():
+    title = request.args.get("title")
+    if not title:
+        return jsonify({"error": "Missing title parameter"}), 400
+    youtube_url = get_status(title)
+    if youtube_url:
+        return jsonify({"youtube_url": youtube_url}), 200
+    else:
+        return jsonify({"error": "Status not found"}), 404
+
+
 @app.route("/youtube-title-check", methods=["GET"])
 def youtube_title_check():
-    from youtube_upload import get_authenticated_service
     title = request.args.get("title")
     if not title:
         return jsonify({"error": "Missing title parameter"}), 400
@@ -87,7 +100,6 @@ def youtube_title_check():
             return jsonify({"error": "Video not found"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 
 @app.route("/", methods=["GET"])
