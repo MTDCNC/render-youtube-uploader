@@ -71,7 +71,7 @@ def bunny_upload_from_url():
     dropbox_url = data.get("dropbox_url")
     title = data.get("title")
     library_id = os.environ.get("BUNNY_STREAM_LIBRARY_ID")
-    api_key = os.environ.get("BUNNY_API_KEY")
+    api_key = os.environ.get("BUNNY_STREAM_API_KEY")
 
     if not dropbox_url or not title or not library_id or not api_key:
         return jsonify({"error": "Missing required fields or config."}), 400
