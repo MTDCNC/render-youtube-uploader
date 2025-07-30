@@ -1,9 +1,10 @@
-# ✅ FINAL app.py with status-check
+# ✅ FINAL app.py with async YouTube upload + status-check
 
 from flask import Flask, request, jsonify
-from youtube_upload import upload_to_youtube
 import json
 import os
+import threading
+from youtube_upload import upload_to_youtube
 
 app = Flask(__name__)
 
@@ -28,6 +29,17 @@ def get_status(title):
     return status.get(title)
 
 
+def async_upload(video_url, title, description, privacy, bunny_delete_url=None, thumbnail_url=None):
+    try:
+        youtube_url = upload_to_youtube(
+            video_url, title, description, privacy,
+            bunny_delete_url, thumbnail_url
+        )
+        save_status(title, youtube_url)
+    except Exception as e:
+        print(f"❌ Async YouTube upload failed for {title}: {e}")
+
+
 @app.route("/upload-to-youtube", methods=["POST"])
 def upload_video():
     data = request.json
@@ -41,17 +53,13 @@ def upload_video():
     if not video_url or not title or not description:
         return jsonify({"error": "Missing required fields (video_url, title, description)"}), 400
 
-    try:
-        youtube_url = upload_to_youtube(
-            video_url, title, description, privacy,
-            bunny_delete_url, thumbnail_url
-        )
-        save_status(title, youtube_url)
-        return jsonify({"youtube_url": youtube_url}), 200
+    thread = threading.Thread(
+        target=async_upload,
+        args=(video_url, title, description, privacy, bunny_delete_url, thumbnail_url)
+    )
+    thread.start()
 
-    except Exception as e:
-        print(f"❌ Fatal Error: {e}")
-        return jsonify({"error": str(e)}), 500
+    return jsonify({"status": "processing", "title": title}), 202
 
 
 @app.route("/status-check", methods=["GET"])
