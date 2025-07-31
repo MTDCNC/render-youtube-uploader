@@ -67,30 +67,32 @@ def upload_video():
 
 @app.route("/youtube-title-check", methods=["GET"])
 def youtube_title_check():
-    title = request.args.get("title")
-    if not title:
+    raw_title = request.args.get("title")
+    if not raw_title:
         return jsonify({"error": "Missing title parameter"}), 400
+
+    # Replace spaces with %20 for query (simulate safe encoding)
+    safe_title = raw_title.replace(" ", "%20")
 
     try:
         youtube = get_authenticated_service()
         search_response = youtube.search().list(
             part="snippet",
             forMine=True,
-            q=title,
+            q=safe_title,
             type="video",
-            maxResults=10
+            maxResults=1
         ).execute()
 
         items = search_response.get("items", [])
-        for item in items:
-            video_title = item['snippet']['title'].strip().lower()
-            if video_title == title.strip().lower():
-                video_id = item['id']['videoId']
-                return jsonify({"youtube_url": f"https://youtu.be/{video_id}"}), 200
-
-        return jsonify({"error": "Exact title match not found"}), 404
+        if items:
+            video_id = items[0]["id"]["videoId"]
+            return jsonify({"youtube_url": f"https://youtu.be/{video_id}"}), 200
+        else:
+            return jsonify({"error": "Video not found"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 
 @app.route("/", methods=["GET"])
