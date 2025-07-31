@@ -65,34 +65,18 @@ def upload_video():
     return jsonify({"status": "processing", "title": title}), 202
 
 
-@app.route("/youtube-title-check", methods=["GET"])
-def youtube_title_check():
+@app.route("/status-check", methods=["GET"])
+def status_check():
     raw_title = request.args.get("title")
     if not raw_title:
         return jsonify({"error": "Missing title parameter"}), 400
 
-    try:
-        youtube = get_authenticated_service()
-        search_response = youtube.search().list(
-            part="snippet",
-            forMine=True,
-            q=raw_title,  # Use raw title as-is
-            type="video",
-            maxResults=10
-        ).execute()
+    youtube_url = get_status(raw_title)
+    if youtube_url:
+        return jsonify({"youtube_url": youtube_url}), 200
+    else:
+        return jsonify({"error": "Not found"}), 404
 
-        items = search_response.get("items", [])
-        print(f"🔍 YouTube Search found {len(items)} item(s)")
-        for item in items:
-            video_title = item['snippet']['title'].strip().lower()
-            print(f"🔎 Found: {video_title} (ID: {item['id']['videoId']})")
-            if video_title == raw_title.strip().lower():
-                video_id = item['id']['videoId']
-                return jsonify({"youtube_url": f"https://youtu.be/{video_id}"}), 200
-
-        return jsonify({"error": "Exact title match not found"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/", methods=["GET"])
