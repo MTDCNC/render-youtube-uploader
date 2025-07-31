@@ -4,6 +4,7 @@ import requests
 import json
 import threading
 import sys
+import uuid
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -29,9 +30,9 @@ def load_status():
         return {}
 
 
-def save_status(title, url):
+def save_status(job_id, youtube_url):
     statuses = load_status()
-    statuses[title] = url
+    statuses[job_id] = youtube_url
     with open(STATUS_FILENAME, 'w') as f:
         json.dump(statuses, f)
         f.flush()
@@ -50,20 +51,15 @@ def get_authenticated_service():
     return build('youtube', 'v3', credentials=creds)
 
 
-def async_upload_to_youtube(video_url, title, description, privacy, thumbnail_url, bunny_delete_url):
+def async_upload_to_youtube(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url):
     try:
-        temp_file = 'temp_video.mp4'
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-            print(f"🗑️ Cleared old {temp_file}", flush=True)
-
-        print(f"⬇️ [Async] Fetching video from {video_url}...", flush=True)
+        temp_file = f'temp_{job_id}.mp4'
+        print(f"🗂️ [{job_id}] Starting download from {video_url}...", flush=True)
         with requests.get(video_url, stream=True) as r:
             r.raise_for_status()
             with open(temp_file, 'wb') as f:
-                for chunk in r.iter_content(1048576):
-                    f.write(chunk)
-        print("✅ [Async] Download complete", flush=True)
+                for chunk in r.iter_content(1048576): f.write(chunk)
+        print(f"✅ [{job_id}] Download complete", flush=True)
 
         yt = get_authenticated_service()
         body = {
@@ -71,46 +67,44 @@ def async_upload_to_youtube(video_url, title, description, privacy, thumbnail_ur
             'status':  {'privacyStatus': privacy, 'madeForKids': False}
         }
         media = MediaFileUpload(temp_file, mimetype='video/*', resumable=True)
-        req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
+        req = yt.videos().insert(part='snippet,status', body=body, media_body=media)
 
-        status = None
+        progress = None; status = None
         while status is None:
             progress, status = req.next_chunk()
             if progress:
-                print(f"📈 [Async] Upload progress: {int(progress.progress()*100)}%", flush=True)
+                print(f"📈 [{job_id}] Upload {int(progress.progress()*100)}%", flush=True)
 
         video_id = status['id']
         youtube_url = f"https://youtu.be/{video_id}"
-        print(f"✅ [Async] Upload complete! YouTube URL: {youtube_url}", flush=True)
+        print(f"✅ [{job_id}] YouTube URL: {youtube_url}", flush=True)
 
         if thumbnail_url:
             try:
-                thumb_file = 'temp_thumb.jpg'
+                thumb_file = f'thumb_{job_id}.jpg'
                 with requests.get(thumbnail_url, stream=True) as tr:
                     tr.raise_for_status()
-                    with open(thumb_file, 'wb') as f:
-                        f.write(tr.content)
-                print("⬇️ [Async] Thumbnail downloaded, setting on YouTube...", flush=True)
+                    open(thumb_file, 'wb').write(tr.content)
+                print(f"⬇️ [{job_id}] Thumb downloaded, setting...", flush=True)
                 yt.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(thumb_file, mimetype='image/jpeg')).execute()
                 os.remove(thumb_file)
-                print("✅ [Async] Thumbnail set", flush=True)
+                print(f"✅ [{job_id}] Thumbnail set", flush=True)
             except Exception as e:
-                print(f"⚠️ [Async] Thumbnail error: {e}", flush=True)
+                print(f"⚠️ [{job_id}] Thumb error: {e}", flush=True)
 
         os.remove(temp_file)
-        print(f"🗑️ [Async] Removed {temp_file}", flush=True)
+        print(f"🗑️ [{job_id}] Removed temp file", flush=True)
         if bunny_delete_url:
             try:
                 dr = requests.delete(bunny_delete_url, headers={'AccessKey': os.environ['BUNNY_API_KEY']})
                 dr.raise_for_status()
-                print("✅ [Async] Bunny file deleted", flush=True)
+                print(f"✅ [{job_id}] Bunny file deleted", flush=True)
             except Exception as e:
-                print(f"⚠️ [Async] Bunny delete failed: {e}", flush=True)
+                print(f"⚠️ [{job_id}] Bunny delete failed: {e}", flush=True)
 
-        save_status(title, youtube_url)
-
+        save_status(job_id, youtube_url)
     except Exception as e:
-        print(f"❌ [Async] Upload error for {title}: {e}", flush=True)
+        print(f"❌ [{job_id}] Upload error: {e}", flush=True)
 
 @app.route('/upload-to-youtube', methods=['POST'])
 def upload_endpoint():
@@ -125,26 +119,26 @@ def upload_endpoint():
     if not all([video_url, title, description]):
         return jsonify({'error': 'Missing video_url, title, or description'}), 400
 
-    print(f"📥 Received upload request for {title}", flush=True)
+    job_id = str(uuid.uuid4())
+    print(f"🚀 [{job_id}] Received job, processing...", flush=True)
     thread = threading.Thread(
         target=async_upload_to_youtube,
-        args=(video_url, title, description, privacy, thumbnail_url, bunny_delete_url),
+        args=(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url),
         daemon=True
     )
     thread.start()
-
-    return jsonify({'status': 'processing', 'title': title}), 202
+    return jsonify({'status': 'processing', 'job_id': job_id}), 202
 
 @app.route('/status-check', methods=['GET'])
 def status_check():
-    title = request.args.get('title')
-    if not title:
-        return jsonify({'error': 'Missing title parameter'}), 400
+    job_id = request.args.get('job_id')
+    if not job_id:
+        return jsonify({'error': 'Missing job_id parameter'}), 400
 
     statuses = load_status()
-    url = statuses.get(title)
-    if url:
-        return jsonify({'youtube_url': url}), 200
+    youtube_url = statuses.get(job_id)
+    if youtube_url:
+        return jsonify({'youtube_url': youtube_url}), 200
     return jsonify({'error': 'Not found'}), 404
 
 @app.route('/', methods=['GET'])
