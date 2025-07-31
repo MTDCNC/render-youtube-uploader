@@ -78,15 +78,17 @@ def youtube_title_check():
             forMine=True,
             q=title,
             type="video",
-            maxResults=1
+            maxResults=10
         ).execute()
 
         items = search_response.get("items", [])
-        if items:
-            video_id = items[0]["id"]["videoId"]
-            return jsonify({"youtube_url": f"https://youtu.be/{video_id}"}), 200
-        else:
-            return jsonify({"error": "Video not found"}), 404
+        for item in items:
+            video_title = item['snippet']['title'].strip().lower()
+            if video_title == title.strip().lower():
+                video_id = item['id']['videoId']
+                return jsonify({"youtube_url": f"https://youtu.be/{video_id}"}), 200
+
+        return jsonify({"error": "Exact title match not found"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
