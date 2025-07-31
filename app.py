@@ -65,51 +65,6 @@ def upload_video():
     return jsonify({"status": "processing", "title": title}), 202
 
 
-@app.route("/bunny-upload-from-url", methods=["POST"])
-def bunny_upload_from_url():
-    data = request.json
-    dropbox_url = data.get("dropbox_url")
-    title = data.get("title")
-    library_id = os.environ.get("BUNNY_STREAM_LIBRARY_ID")
-    api_key = os.environ.get("BUNNY_STREAM_API_KEY")
-
-    if not dropbox_url or not title or not library_id or not api_key:
-        return jsonify({"error": "Missing required fields or config."}), 400
-
-    payload = {
-        "title": title,
-        "videoUrl": dropbox_url
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "AccessKey": api_key
-    }
-
-    try:
-        response = requests.post(
-            f"https://video.bunnycdn.com/library/{library_id}/videos",
-            json=payload,
-            headers=headers
-        )
-        response.raise_for_status()
-        return jsonify(response.json()), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/status-check", methods=["GET"])
-def status_check():
-    title = request.args.get("title")
-    if not title:
-        return jsonify({"error": "Missing title parameter"}), 400
-    youtube_url = get_status(title)
-    if youtube_url:
-        return jsonify({"youtube_url": youtube_url}), 200
-    else:
-        return jsonify({"error": "Status not found"}), 404
-
-
 @app.route("/youtube-title-check", methods=["GET"])
 def youtube_title_check():
     title = request.args.get("title")
