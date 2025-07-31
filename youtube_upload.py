@@ -7,7 +7,10 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
+scopes = [
+    "https://www.googleapis.com/auth/youtube",
+    "https://www.googleapis.com/auth/youtube.upload"
+]
 
 
 def get_authenticated_service():
