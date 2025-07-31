@@ -14,16 +14,18 @@ SCOPES = [
 
 
 def get_authenticated_service():
+    print("⚙️ Building YouTube API client...") 
+    
     creds = Credentials(
         token=None,
         refresh_token=os.environ['YOUTUBE_REFRESH_TOKEN'],
-        token_uri='https://oauth2.googleapis.com/token',
-        client_id=os.environ['YOUTUBE_CLIENT_ID'],
-        client_secret=os.environ['YOUTUBE_CLIENT_SECRET'],
+        token_uri=os.environ.get("YOUTUBE_TOKEN_URI", "https://oauth2.googleapis.com/token"),
+        client_id=os.environ.get("YOUTUBE_CLIENT_ID"),
+        client_secret=os.environ.get("YOUTUBE_CLIENT_SECRET"),
         scopes=SCOPES
     )
-    creds.refresh(google.auth.transport.requests.Request())
-    return build('youtube', 'v3', credentials=creds)
+    print(f"✅ Loaded credentials: {creds.valid=}, {creds.expired=}, {creds.refresh_token is not None=}")
+    return build("youtube", "v3", credentials=creds)
 
 
 def upload_to_youtube(video_url, title, description, privacy, bunny_delete_url=None, thumbnail_url=None):
