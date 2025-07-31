@@ -71,28 +71,28 @@ def youtube_title_check():
     if not raw_title:
         return jsonify({"error": "Missing title parameter"}), 400
 
-    # Replace spaces with %20 for query (simulate safe encoding)
-    safe_title = raw_title.replace(" ", "%20")
-
     try:
         youtube = get_authenticated_service()
         search_response = youtube.search().list(
             part="snippet",
             forMine=True,
-            q=safe_title,
+            q=raw_title,  # Use raw title as-is
             type="video",
-            maxResults=1
+            maxResults=10
         ).execute()
 
         items = search_response.get("items", [])
-        if items:
-            video_id = items[0]["id"]["videoId"]
-            return jsonify({"youtube_url": f"https://youtu.be/{video_id}"}), 200
-        else:
-            return jsonify({"error": "Video not found"}), 404
+        print(f"🔍 YouTube Search found {len(items)} item(s)")
+        for item in items:
+            video_title = item['snippet']['title'].strip().lower()
+            print(f"🔎 Found: {video_title} (ID: {item['id']['videoId']})")
+            if video_title == raw_title.strip().lower():
+                video_id = item['id']['videoId']
+                return jsonify({"youtube_url": f"https://youtu.be/{video_id}"}), 200
+
+        return jsonify({"error": "Exact title match not found"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 
 @app.route("/", methods=["GET"])
