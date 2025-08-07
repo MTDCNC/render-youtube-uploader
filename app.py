@@ -51,7 +51,7 @@ def get_authenticated_service():
     return build('youtube', 'v3', credentials=creds)
 
 
-def async_upload_to_youtube(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url):
+def async_upload_to_youtube(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags):
     try:
         temp_file = f'temp_{job_id}.mp4'
         print(f"🗂️ [{job_id}] Starting download from {video_url}...", flush=True)
@@ -62,8 +62,10 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
         print(f"✅ [{job_id}] Download complete", flush=True)
 
         yt = get_authenticated_service()
+        tag_list = [t.strip() for t in raw_tags.split(',') if t.strip()]
+        
         body = {
-            'snippet': {'title': title, 'description': description},
+            'snippet': {'title': title, 'description': description, 'tags': tag_list},
             'status':  {'privacyStatus': privacy, 'madeForKids': False}
         }
         media = MediaFileUpload(temp_file, mimetype='video/*', resumable=True)
@@ -112,6 +114,7 @@ def upload_endpoint():
     video_url = data.get('video_url')
     title = data.get('title')
     description = data.get('description')
+    raw_tags = data.get('tags', '')  
     privacy = data.get('privacy', 'unlisted')
     thumbnail_url = data.get('thumbnail_url')
     bunny_delete_url = data.get('bunny_delete_url')
@@ -123,7 +126,7 @@ def upload_endpoint():
     print(f"🚀 [{job_id}] Received job, processing...", flush=True)
     thread = threading.Thread(
         target=async_upload_to_youtube,
-        args=(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url),
+        args=(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags),
         daemon=True
     )
     thread.start()
