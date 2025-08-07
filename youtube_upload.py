@@ -28,7 +28,7 @@ def get_authenticated_service():
     return build("youtube", "v3", credentials=creds)
 
 
-def upload_to_youtube(video_url, title, description, privacy, bunny_delete_url=None, thumbnail_url=None):
+def upload_to_youtube(video_url, title, description, privacy, bunny_delete_url=None, thumbnail_url=None, raw_tags=""):
     if os.path.exists("temp_video.mp4"):
         os.remove("temp_video.mp4")
         print("🗑️ Previous temp_video.mp4 deleted.")
@@ -43,9 +43,10 @@ def upload_to_youtube(video_url, title, description, privacy, bunny_delete_url=N
     print(f"✅ Download complete.")
 
     youtube = get_authenticated_service()
+    tag_list = [t.strip() for t in raw_tags.split(',') if t.strip()]
 
     body = {
-        'snippet': {'title': title, 'description': description},
+        'snippet': {'title': title, 'description': description, 'tags': tag_list},
         'status': {'privacyStatus': privacy, 'madeForKids': False}
     }
 
