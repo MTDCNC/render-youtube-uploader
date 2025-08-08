@@ -5,14 +5,15 @@ import json
 import threading
 import sys
 import uuid
+from datetime import datetime
+from urllib.parse import urlparse
 from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.auth.transport.requests import Request
-from datetime import datetime
 
-# Ensure immediate logs
+# Ensure immediate logs to stdout
 sys.stdout.reconfigure(line_buffering=True)
 
 app = Flask(__name__)
@@ -22,9 +23,9 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube"
 ]
-STATUS_FILENAME = "youtube_status.json"
+STATUS_FILENAME = "youtube_status.json"  # job_id -> dict
 
-# Channel selection logic
+# ---------- Channel selection ----------
 def select_channel_by_location(location: str) -> str:
     loc = (location or "").lower()
     if "united kingdom" in loc:
@@ -35,7 +36,7 @@ def select_channel_by_location(location: str) -> str:
         return "Asia"
     return "UK"
 
-# Load and save status for async checks
+# ---------- Status persistence ----------
 def load_status():
     try:
         with open(STATUS_FILENAME, 'r') as f:
@@ -45,7 +46,6 @@ def load_status():
 
 
 def write_status(job_id: str, patch: dict):
-    """Merge a partial update into the job's record and persist to disk."""
     statuses = load_status()
     current = statuses.get(job_id, {})
     current.update(patch)
@@ -55,15 +55,15 @@ def write_status(job_id: str, patch: dict):
         f.flush()
         os.fsync(f.fileno())
 
-# Instantiate YouTube client per channel
+# ---------- YouTube client per channel ----------
 def get_authenticated_service(channel_key: str):
-    # Map channel key to environment variable names
     mapping = {
         'UK':   ('YT_UK_CLIENT_ID', 'YT_UK_CLIENT_SECRET', 'YT_UK_REFRESH_TOKEN'),
         'US':   ('YT_US_CLIENT_ID', 'YT_US_CLIENT_SECRET', 'YT_US_REFRESH_TOKEN'),
         'Asia': ('YT_ASIA_CLIENT_ID', 'YT_ASIA_CLIENT_SECRET', 'YT_ASIA_REFRESH_TOKEN'),
     }
     client_id_key, client_secret_key, refresh_token_key = mapping[channel_key]
+
     creds = Credentials(
         token=None,
         refresh_token=os.environ[refresh_token_key],
@@ -73,25 +73,32 @@ def get_authenticated_service(channel_key: str):
         scopes=SCOPES
     )
     try:
-        creds.refresh(Request())
+        creds.refresh(Request())  # explicit test refresh so revoked tokens surface
     except RefreshError as e:
         app.logger.error(f"OAuth refresh failed for {channel_key}: {e}")
-        # TODO: integrate with alert system (Slack, email, etc.)
         raise
     return build('youtube', 'v3', credentials=creds)
 
-# Core upload logic (async)
+# ---------- Async uploader ----------
 def async_upload_to_youtube(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags, channel_key):
     try:
+        # Derive a friendly name from the source URL for logs
+        parsed = urlparse(video_url)
+        filename = os.path.basename(parsed.path) or f"video_{job_id}.mp4"
         temp_file = f'temp_{job_id}.mp4'
-        app.logger.info(f"[{job_id}] Downloading {video_url}")
+
+        app.logger.info(f"Starting JobID {job_id}")
+        app.logger.info(f"Uploading File \"{filename}\" to YouTube Channel \"{channel_key}\"")
+
+        # Download
         with requests.get(video_url, stream=True) as r:
             r.raise_for_status()
             with open(temp_file, 'wb') as f:
                 for chunk in r.iter_content(1048576):
                     f.write(chunk)
-        app.logger.info(f"[{job_id}] Download complete")
+        app.logger.info(f"[{job_id}] Download complete -> {temp_file}")
 
+        # Build YouTube client & request
         yt = get_authenticated_service(channel_key)
         tag_list = [t.strip() for t in raw_tags.split(',') if t.strip()]
         body = {
@@ -101,36 +108,45 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
         media = MediaFileUpload(temp_file, mimetype='video/*', resumable=True)
         req = yt.videos().insert(part='snippet,status', body=body, media_body=media)
 
+        # Progress logging every 5%
+        last_logged = -5
         progress, status = None, None
         while status is None:
             progress, status = req.next_chunk()
             if progress:
-                app.logger.info(f"[{job_id}] Upload {int(progress.progress()*100)}%")
+                pct = int(progress.progress() * 100)
+                if pct - last_logged >= 5:
+                    app.logger.info(f"[{job_id}] {pct}%")
+                    last_logged = pct
 
         video_id = status['id']
         youtube_url = f"https://youtu.be/{video_id}"
-        app.logger.info(f"[{job_id}] YouTube URL: {youtube_url}")
+        app.logger.info(f"File live on YouTube at \"{youtube_url}\"")
 
-        # Set thumbnail if provided
+        # Thumbnail (non-fatal)
         if thumbnail_url:
             try:
                 thumb_file = f'thumb_{job_id}.jpg'
                 with requests.get(thumbnail_url, stream=True) as tr:
                     tr.raise_for_status()
-                    open(thumb_file, 'wb').write(tr.content)
-                yt.thumbnails().set(
-                    videoId=video_id,
-                    media_body=MediaFileUpload(thumb_file, mimetype='image/jpeg')
-                ).execute()
+                    with open(thumb_file, 'wb') as tf:
+                        tf.write(tr.content)
+                yt.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(thumb_file, mimetype='image/jpeg')).execute()
                 os.remove(thumb_file)
                 app.logger.info(f"[{job_id}] Thumbnail set")
             except Exception as e:
                 app.logger.warning(f"[{job_id}] Thumbnail error: {e}")
 
-        # Cleanup
-        os.remove(temp_file)
+        # Cleanup local temp
+        try:
+            os.remove(temp_file)
+        except Exception:
+            pass
+
+        # Bunny delete
         if bunny_delete_url:
             try:
+                app.logger.info(f"Deleting \"{filename}\" from Bunny-Temp-Storage")
                 dr = requests.delete(bunny_delete_url, headers={'AccessKey': os.environ.get('BUNNY_API_KEY')})
                 dr.raise_for_status()
                 info = {
@@ -138,18 +154,23 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
                     'status_code': dr.status_code,
                     'text': (dr.text or '')[:500]
                 }
+                app.logger.info("File Deleted")
                 app.logger.info(f"[{job_id}] Bunny delete response: {info}")
                 write_status(job_id, {'bunny_delete': info})
-                app.logger.info(f"[{job_id}] Bunny file deleted")
             except Exception as e:
                 app.logger.warning(f"[{job_id}] Bunny delete failed: {e}")
                 write_status(job_id, {'bunny_delete': {'ok': False, 'error': str(e)}})
 
+        # Persist final state
         write_status(job_id, {
-        'state': 'completed',
-        'youtube_url': youtube_url,
-        'finished_at': datetime.utcnow().isoformat() + 'Z'
-    })
+            'state': 'completed',
+            'youtube_url': youtube_url,
+            'finished_at': datetime.utcnow().isoformat() + 'Z',
+            'channel': channel_key,
+            'source_filename': filename
+        })
+        app.logger.info("Automation complete")
+
     except Exception as e:
         app.logger.error(f"[{job_id}] Upload error: {e}")
         write_status(job_id, {
@@ -158,25 +179,26 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
             'finished_at': datetime.utcnow().isoformat() + 'Z'
         })
 
-# Endpoint for uploading
+# ---------- Routes ----------
 @app.route('/upload-to-youtube', methods=['POST'])
 def upload_endpoint():
     data = request.json or {}
-    video_url       = data.get('video_url')
-    title           = data.get('title')
-    description     = data.get('description')
-    raw_tags        = data.get('tags', '')
-    privacy         = data.get('privacy', 'unlisted')
-    thumbnail_url   = data.get('thumbnail_url')
-    bunny_delete_url= data.get('bunny_delete_url')
-    raw_loc         = data.get('location', '')
-    channel_key     = select_channel_by_location(raw_loc)
+    video_url        = data.get('video_url')
+    title            = data.get('title')
+    description      = data.get('description')
+    raw_tags         = data.get('tags', '')
+    privacy          = data.get('privacy', 'unlisted')
+    thumbnail_url    = data.get('thumbnail_url')
+    bunny_delete_url = data.get('bunny_delete_url')
+    raw_loc          = data.get('location', '')
+    channel_key      = select_channel_by_location(raw_loc)
 
     if not all([video_url, title, description]):
         return jsonify({'error': 'Missing video_url, title, or description'}), 400
 
     job_id = str(uuid.uuid4())
-    # record initial status for polling
+
+    # Record initial status for polling
     write_status(job_id, {
         'state': 'processing',
         'channel': channel_key,
@@ -184,7 +206,9 @@ def upload_endpoint():
         'location_raw': raw_loc,
         'started_at': datetime.utcnow().isoformat() + 'Z'
     })
+
     app.logger.info(f"[{job_id}] Received job for channel {channel_key}")
+
     thread = threading.Thread(
         target=async_upload_to_youtube,
         args=(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags, channel_key),
@@ -193,9 +217,8 @@ def upload_endpoint():
     thread.start()
     return jsonify({'status': 'processing', 'job_id': job_id, 'channel': channel_key}), 202
 
-# Status check endpoint
-@app.route('/status-check', methods=['GET'])
 
+@app.route('/status-check', methods=['GET'])
 def status_check():
     job_id = request.args.get('job_id')
     if not job_id:
@@ -206,7 +229,7 @@ def status_check():
         return jsonify(data), 200
     return jsonify({'error': 'Not found'}), 404
 
-# Health check
+
 @app.route('/', methods=['GET'])
 def health():
     return "YouTube Uploader is live!", 200
