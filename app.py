@@ -47,7 +47,7 @@ def save_status(job_id, youtube_url):
     statuses[job_id] = youtube_url
     with open(STATUS_FILENAME, 'w') as f:
         json.dump(statuses, f)
-        f.flush()https://github.com/MTDCNC/render-youtube-uploader/blob/main/app.py
+        f.flush()
         os.fsync(f.fileno())
 
 # Instantiate YouTube client per channel
