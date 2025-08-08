@@ -10,7 +10,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.auth.transport.requests import Request
-
+from datetime import datetime
 
 # Ensure immediate logs
 sys.stdout.reconfigure(line_buffering=True)
@@ -44,9 +44,12 @@ def load_status():
         return {}
 
 
-def save_status(job_id, youtube_url):
+def write_status(job_id: str, patch: dict):
+    """Merge a partial update into the job's record and persist to disk."""
     statuses = load_status()
-    statuses[job_id] = youtube_url
+    current = statuses.get(job_id, {})
+    current.update(patch)
+    statuses[job_id] = current
     with open(STATUS_FILENAME, 'w') as f:
         json.dump(statuses, f)
         f.flush()
@@ -70,7 +73,7 @@ def get_authenticated_service(channel_key: str):
         scopes=SCOPES
     )
     try:
-        creds.refresh(Request())   # was: creds.refresh()
+        creds.refresh(Request())
     except RefreshError as e:
         app.logger.error(f"OAuth refresh failed for {channel_key}: {e}")
         # TODO: integrate with alert system (Slack, email, etc.)
@@ -130,13 +133,30 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
             try:
                 dr = requests.delete(bunny_delete_url, headers={'AccessKey': os.environ.get('BUNNY_API_KEY')})
                 dr.raise_for_status()
+                info = {
+                    'ok': dr.ok,
+                    'status_code': dr.status_code,
+                    'text': (dr.text or '')[:500]
+                }
+                app.logger.info(f"[{job_id}] Bunny delete response: {info}")
+                write_status(job_id, {'bunny_delete': info})
                 app.logger.info(f"[{job_id}] Bunny file deleted")
             except Exception as e:
                 app.logger.warning(f"[{job_id}] Bunny delete failed: {e}")
+                write_status(job_id, {'bunny_delete': {'ok': False, 'error': str(e)}})
 
-        save_status(job_id, youtube_url)
+        write_status(job_id, {
+        'state': 'completed',
+        'youtube_url': youtube_url,
+        'finished_at': datetime.utcnow().isoformat() + 'Z'
+    })
     except Exception as e:
         app.logger.error(f"[{job_id}] Upload error: {e}")
+        write_status(job_id, {
+            'state': 'error',
+            'error': str(e),
+            'finished_at': datetime.utcnow().isoformat() + 'Z'
+        })
 
 # Endpoint for uploading
 @app.route('/upload-to-youtube', methods=['POST'])
@@ -156,6 +176,14 @@ def upload_endpoint():
         return jsonify({'error': 'Missing video_url, title, or description'}), 400
 
     job_id = str(uuid.uuid4())
+    # record initial status for polling
+    write_status(job_id, {
+        'state': 'processing',
+        'channel': channel_key,
+        'title': title,
+        'location_raw': raw_loc,
+        'started_at': datetime.utcnow().isoformat() + 'Z'
+    })
     app.logger.info(f"[{job_id}] Received job for channel {channel_key}")
     thread = threading.Thread(
         target=async_upload_to_youtube,
@@ -163,7 +191,7 @@ def upload_endpoint():
         daemon=True
     )
     thread.start()
-    return jsonify({'status': 'processing', 'job_id': job_id}), 202
+    return jsonify({'status': 'processing', 'job_id': job_id, 'channel': channel_key}), 202
 
 # Status check endpoint
 @app.route('/status-check', methods=['GET'])
@@ -173,10 +201,9 @@ def status_check():
     if not job_id:
         return jsonify({'error': 'Missing job_id parameter'}), 400
 
-    statuses = load_status()
-    youtube_url = statuses.get(job_id)
-    if youtube_url:
-        return jsonify({'youtube_url': youtube_url}), 200
+    data = load_status().get(job_id)
+    if data:
+        return jsonify(data), 200
     return jsonify({'error': 'Not found'}), 404
 
 # Health check
