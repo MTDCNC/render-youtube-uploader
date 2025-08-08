@@ -9,6 +9,8 @@ from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from google.auth.transport.requests import Request
+
 
 # Ensure immediate logs
 sys.stdout.reconfigure(line_buffering=True)
@@ -68,7 +70,7 @@ def get_authenticated_service(channel_key: str):
         scopes=SCOPES
     )
     try:
-        creds.refresh()
+        creds.refresh(Request())   # was: creds.refresh()
     except RefreshError as e:
         app.logger.error(f"OAuth refresh failed for {channel_key}: {e}")
         # TODO: integrate with alert system (Slack, email, etc.)
