@@ -13,6 +13,9 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.auth.transport.requests import Request
 
+from requests.auth import HTTPBasicAuth
+import mimetypes
+
 # Ensure immediate logs to stdout
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -79,7 +82,7 @@ def get_authenticated_service(channel_key: str):
         raise
     return build('youtube', 'v3', credentials=creds)
 
-# ---------- Async uploader ----------
+# ---------- Async uploader (YouTube) ----------
 def async_upload_to_youtube(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags, channel_key):
     try:
         # Derive a friendly name from the source URL for logs
@@ -179,6 +182,108 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
             'finished_at': datetime.utcnow().isoformat() + 'Z'
         })
 
+# ---------- WordPress async upload helpers ----------
+WP_STATUS_FILENAME = "wp_status.json"  # job_id -> {attachment_id, source_url, ...}
+
+def wp_load_status():
+    try:
+        with open(WP_STATUS_FILENAME, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+def wp_write_status(job_id: str, patch: dict):
+    statuses = wp_load_status()
+    current = statuses.get(job_id, {})
+    current.update(patch)
+    statuses[job_id] = current
+    with open(WP_STATUS_FILENAME, 'w') as f:
+        json.dump(statuses, f)
+        f.flush()
+        os.fsync(f.fileno())
+
+def _wp_api_base():
+    base = os.environ.get("WP_API_BASE")  # e.g. https://example.com/wp-json/wp/v2
+    if not base:
+        raise RuntimeError("Missing env var WP_API_BASE")
+    return base.rstrip('/')
+
+def _wp_auth():
+    user = os.environ.get("WP_USER")
+    app_pass = os.environ.get("WP_APP_PASSWORD")
+    if not user or not app_pass:
+        raise RuntimeError("Missing WP_USER or WP_APP_PASSWORD")
+    return HTTPBasicAuth(user, app_pass)
+
+def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post_id):
+    """
+    Downloads from Bunny CDN and uploads to WordPress Media Library.
+    Non-fatal on metadata update failure. Persists results to wp_status.json.
+    """
+    try:
+        # 1) Download Bunny file
+        temp_path = f'wp_{job_id}'
+        app.logger.info(f"[WP {job_id}] Downloading {video_url}")
+        with requests.get(video_url, stream=True) as r:
+            r.raise_for_status()
+            with open(temp_path, 'wb') as f:
+                for chunk in r.iter_content(1048576):
+                    f.write(chunk)
+        app.logger.info(f"[WP {job_id}] Download complete -> {temp_path}")
+
+        # 2) Upload to WP /media (multipart)
+        api_base = _wp_api_base()
+        media_ep = f"{api_base}/media"
+        guess, _ = mimetypes.guess_type(filename or "")
+        mime = guess or "video/mp4"
+        up_name = filename or f"video_{job_id}.mp4"
+
+        with open(temp_path, "rb") as fh:
+            files = {"file": (up_name, fh, mime)}
+            headers = {"Content-Disposition": f'attachment; filename="{up_name}"'}
+            resp = requests.post(media_ep, files=files, headers=headers, auth=_wp_auth(), timeout=900)
+        resp.raise_for_status()
+        media_json = resp.json()
+        attachment_id = media_json.get("id")
+        source_url = media_json.get("source_url")
+        app.logger.info(f"[WP {job_id}] Uploaded: id={attachment_id} url={source_url}")
+
+        # 3) Optional metadata / attach to post
+        if any([title, alt_text, post_id]):
+            patch = {}
+            if title:    patch["title"] = title
+            if alt_text: patch["alt_text"] = alt_text
+            if post_id:  patch["post"] = int(post_id)
+            try:
+                meta_ep = f"{api_base}/media/{attachment_id}"
+                pr = requests.post(meta_ep, json=patch, auth=_wp_auth(), timeout=120)
+                pr.raise_for_status()
+                app.logger.info(f"[WP {job_id}] Metadata updated")
+            except Exception as e:
+                app.logger.warning(f"[WP {job_id}] Meta update failed: {e}")
+
+        # 4) Cleanup temp, save status
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+
+        wp_write_status(job_id, {
+            'state': 'completed',
+            'attachment_id': attachment_id,
+            'source_url': source_url,
+            'finished_at': datetime.utcnow().isoformat() + 'Z',
+            'filename': up_name
+        })
+
+    except Exception as e:
+        app.logger.error(f"[WP {job_id}] Upload error: {e}")
+        wp_write_status(job_id, {
+            'state': 'error',
+            'error': str(e),
+            'finished_at': datetime.utcnow().isoformat() + 'Z'
+        })
+
 # ---------- Routes ----------
 @app.route('/upload-to-youtube', methods=['POST'])
 def upload_endpoint():
@@ -229,6 +334,48 @@ def status_check():
         return jsonify(data), 200
     return jsonify({'error': 'Not found'}), 404
 
+# ---------- New WordPress routes ----------
+@app.route('/upload-to-wordpress', methods=['POST'])
+def upload_to_wordpress():
+    data = request.json or {}
+    video_url = data.get('video_url')           # Bunny CDN file
+    filename  = data.get('filename')            # e.g. "clip.mp4"
+    title     = data.get('title')               # optional
+    alt_text  = data.get('alt_text')            # optional
+    post_id   = data.get('post_id')             # optional
+
+    if not video_url:
+        return jsonify({'error': 'Missing video_url'}), 400
+
+    job_id = str(uuid.uuid4())
+
+    # Record initial WP status for polling
+    wp_write_status(job_id, {
+        'state': 'processing',
+        'title': title,
+        'started_at': datetime.utcnow().isoformat() + 'Z'
+    })
+
+    app.logger.info(f"[WP {job_id}] Received job")
+    thread = threading.Thread(
+        target=async_upload_to_wordpress,
+        args=(job_id, video_url, filename, title, alt_text, post_id),
+        daemon=True
+    )
+    thread.start()
+    return jsonify({'status': 'processing', 'job_id': job_id}), 202
+
+
+@app.route('/wp-status', methods=['GET'])
+def wp_status():
+    job_id = request.args.get('job_id')
+    if not job_id:
+        return jsonify({'error': 'Missing job_id parameter'}), 400
+
+    entry = wp_load_status().get(job_id)
+    if entry:
+        return jsonify(entry), 200
+    return jsonify({'error': 'Not found'}), 404
 
 @app.route('/', methods=['GET'])
 def health():
