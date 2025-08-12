@@ -83,7 +83,7 @@ def get_authenticated_service(channel_key: str):
     return build('youtube', 'v3', credentials=creds)
 
 # ---------- Async uploader (YouTube) ----------
-def async_upload_to_youtube(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags, channel_key):
+def async_upload_to_youtube(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags, channel_key, publish_at=None):
     try:
         # Derive a friendly name from the source URL for logs
         parsed = urlparse(video_url)
@@ -104,9 +104,31 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
         # Build YouTube client & request
         yt = get_authenticated_service(channel_key)
         tag_list = [t.strip() for t in raw_tags.split(',') if t.strip()]
+        # Decide scheduling
+        status_obj = {'privacyStatus': privacy, 'madeForKids': False}
+        
+        if publish_at:
+            try:
+                # Parse RFC3339 or "YYYY-MM-DD HH:mm" from Monday
+                if 'T' in publish_at:
+                    dt = datetime.fromisoformat(publish_at.replace('Z', '+00:00'))
+                else:
+                    dt = datetime.strptime(publish_at, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        
+                now_utc = datetime.now(timezone.utc)
+        
+                if dt > now_utc:
+                    status_obj['privacyStatus'] = 'private'
+                    status_obj['publishAt'] = dt.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+                    app.logger.info(f"[{job_id}] Scheduled for future publish at {status_obj['publishAt']}")
+                else:
+                    app.logger.info(f"[{job_id}] publish_at is in the past — publishing immediately.")
+            except Exception as e:
+                app.logger.warning(f"[{job_id}] Could not parse publish_at '{publish_at}': {e}")
+
         body = {
             'snippet': {'title': title, 'description': description, 'tags': tag_list},
-            'status':  {'privacyStatus': privacy, 'madeForKids': False}
+            'status': status_obj
         }
         media = MediaFileUpload(temp_file, mimetype='video/*', resumable=True)
         req = yt.videos().insert(part='snippet,status', body=body, media_body=media)
@@ -297,6 +319,7 @@ def upload_endpoint():
     bunny_delete_url = data.get('bunny_delete_url')
     raw_loc          = data.get('location', '')
     channel_key      = select_channel_by_location(raw_loc)
+    publish_at       = data.get('publish_at')
 
     if not all([video_url, title, description]):
         return jsonify({'error': 'Missing video_url, title, or description'}), 400
@@ -316,7 +339,7 @@ def upload_endpoint():
 
     thread = threading.Thread(
         target=async_upload_to_youtube,
-        args=(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags, channel_key),
+        args=(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags, channel_key, publish_at),
         daemon=True
     )
     thread.start()
