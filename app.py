@@ -5,7 +5,7 @@ import json
 import threading
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
