@@ -104,27 +104,36 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
         # Build YouTube client & request
         yt = get_authenticated_service(channel_key)
         tag_list = [t.strip() for t in raw_tags.split(',') if t.strip()]
-        # Decide scheduling
+                # Decide scheduling
         status_obj = {'privacyStatus': privacy, 'madeForKids': False}
-        
+
         if publish_at:
             try:
-                # Parse RFC3339 or "YYYY-MM-DD HH:mm" from Monday
+                app.logger.info(f"[{job_id}] Received publish_at={publish_at}")
+
+                # Try multiple formats for maximum compatibility
                 if 'T' in publish_at:
-                    dt = datetime.fromisoformat(publish_at.replace('Z', '+00:00'))
+                    # ISO8601 (with or without Z)
+                    if publish_at.endswith('Z'):
+                        publish_at = publish_at.replace('Z', '+00:00')
+                    dt = datetime.fromisoformat(publish_at)
                 else:
+                    # "YYYY-MM-DD HH:mm"
                     dt = datetime.strptime(publish_at, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-        
+
                 now_utc = datetime.now(timezone.utc)
-        
+
                 if dt > now_utc:
+                    # Required by YouTube API: must be 'private' to schedule
                     status_obj['privacyStatus'] = 'private'
                     status_obj['publishAt'] = dt.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
-                    app.logger.info(f"[{job_id}] Scheduled for future publish at {status_obj['publishAt']}")
+                    app.logger.info(f"[{job_id}] Scheduling for future publish at {status_obj['publishAt']}")
                 else:
                     app.logger.info(f"[{job_id}] publish_at is in the past — publishing immediately.")
+
             except Exception as e:
                 app.logger.warning(f"[{job_id}] Could not parse publish_at '{publish_at}': {e}")
+
 
         body = {
             'snippet': {'title': title, 'description': description, 'tags': tag_list},
