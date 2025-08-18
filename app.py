@@ -1,8 +1,6 @@
 # app.py
-# Purpose: Async upload service for YouTube and WordPress with robust logging.
-# - Returns {"status":"processing","job_id":...} immediately to avoid Zapier timeouts.
-# - Background threads do the real work and write progress/results to local JSON status files.
-# - Render logs show: request IDs, percent progress for downloads/uploads, clear error reasons.
+# Async uploads to YouTube & WordPress with robust logging and low-memory streaming.
+# Returns {"status":"processing","job_id":...} immediately to avoid Zapier timeouts.
 
 from flask import Flask, request, jsonify, g, has_request_context
 import os
@@ -13,11 +11,16 @@ import logging
 import traceback
 import threading
 import mimetypes
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests
 from requests.auth import HTTPBasicAuth
+from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
+
+import psutil
+import tracemalloc
 
 from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
@@ -25,7 +28,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.auth.transport.requests import Request
 
-# ---------- Ensure immediate logs to stdout (Render) ----------
+# ---------- immediate stdout so Render shows logs right away ----------
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
@@ -33,7 +36,7 @@ except Exception:
 
 app = Flask(__name__)
 
-# ---------- Logging setup ----------
+# ---------- logging with request/job IDs ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(request_id)s] %(message)s",
@@ -42,10 +45,8 @@ logging.basicConfig(
 
 class RequestIdFilter(logging.Filter):
     def filter(self, record):
-        # default if nothing supplied
         if not hasattr(record, "request_id"):
             record.request_id = "-"
-        # prefer Flask's request-scoped id when a request context exists
         if has_request_context() and hasattr(g, "request_id"):
             record.request_id = g.request_id
         return True
@@ -63,20 +64,47 @@ def _after(resp):
     return resp
 
 def job_logger(job_id: str) -> logging.LoggerAdapter:
-    # Stable 8-char id printed in each threaded log line
     return logging.LoggerAdapter(app.logger, {"request_id": job_id[:8]})
 
 def now_utc_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
-# ---------- OAuth / YouTube config ----------
+# ---------- memory tracing ----------
+tracemalloc.start(10)
+PROC = psutil.Process()
+
+def memlog(tag: str):
+    try:
+        rss = PROC.memory_info().rss  # bytes
+        app.logger.info(f"[MEM] {tag}: rss={rss/1024/1024:.1f}MB")
+    except Exception:
+        pass
+
+def top_allocs(tag: str, limit=5):
+    try:
+        snap = tracemalloc.take_snapshot()
+        top = snap.statistics('lineno')[:limit]
+        app.logger.info(f"[MEM] {tag} top allocations:")
+        for st in top:
+            app.logger.info(f"[MEM]   {st.count} blocks, {st.size/1024/1024:.1f}MB at {st.traceback[0]}")
+    except Exception:
+        pass
+
+# ---------- throttle: one heavy job at a time (prevents double RAM spikes) ----------
+JOB_SEM = threading.Semaphore(1)
+
+def _with_gate(fn, *args, **kwargs):
+    with JOB_SEM:
+        return fn(*args, **kwargs)
+
+# ---------- OAuth / YouTube ----------
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube",
 ]
-STATUS_FILENAME = "youtube_status.json"  # job_id -> dict
+STATUS_FILENAME = "youtube_status.json"   # ephemeral (as requested)
+WP_STATUS_FILENAME = "wp_status.json"     # ephemeral (as requested)
 
-# ---------- Channel selection ----------
 def select_channel_by_location(location: str) -> str:
     loc = (location or "").lower()
     if "united kingdom" in loc:
@@ -87,7 +115,6 @@ def select_channel_by_location(location: str) -> str:
         return "Asia"
     return "UK"
 
-# ---------- Status persistence (YouTube) ----------
 def load_status():
     try:
         with open(STATUS_FILENAME, "r") as f:
@@ -104,9 +131,6 @@ def write_status(job_id: str, patch: dict):
         json.dump(statuses, f)
         f.flush()
         os.fsync(f.fileno())
-
-# ---------- Status persistence (WordPress) ----------
-WP_STATUS_FILENAME = "wp_status.json"  # job_id -> {attachment_id, source_url, ...}
 
 def wp_load_status():
     try:
@@ -125,7 +149,6 @@ def wp_write_status(job_id: str, patch: dict):
         f.flush()
         os.fsync(f.fileno())
 
-# ---------- YouTube client per channel ----------
 def get_authenticated_service(channel_key: str):
     mapping = {
         "UK":   ("YT_UK_CLIENT_ID", "YT_UK_CLIENT_SECRET", "YT_UK_REFRESH_TOKEN"),
@@ -142,14 +165,13 @@ def get_authenticated_service(channel_key: str):
         scopes=SCOPES,
     )
     try:
-        # Surface invalid/expired tokens early
         creds.refresh(Request())
     except RefreshError as e:
         app.logger.error(f"OAuth refresh failed for {channel_key}: {e}")
         raise
     return build("youtube", "v3", credentials=creds)
 
-# ---------- Streamed download with % logs ----------
+# ---------- streamed GET (download) with % logs ----------
 def streamed_download_to_file(logger: logging.Logger, url: str, dest_path: str, job_tag: str, chunk_size=1_048_576):
     with requests.get(url, stream=True) as r:
         r.raise_for_status()
@@ -166,51 +188,26 @@ def streamed_download_to_file(logger: logging.Logger, url: str, dest_path: str, 
                     pct = int((read / total) * 100)
                     if pct >= next_pct:
                         logger.info(f"{job_tag} download {pct}%")
+                        memlog(f"{job_tag} download {pct}%")
                         next_pct += 10
     logger.info(f"{job_tag} download complete -> {dest_path}")
 
-# ---------- File wrapper to log WP upload progress ----------
-class LoggingFile:
-    def __init__(self, file_obj, size: int, logger: logging.Logger, job_tag: str, step_label="upload", log_step=10):
-        self._f = file_obj
-        self._size = max(size or 0, 1)
-        self._logger = logger
-        self._job_tag = job_tag
-        self._step_label = step_label
-        self._next_pct = 0
-        self._sent = 0
-        self._log_step = max(1, log_step)
-
-    def read(self, amt=None):
-        data = self._f.read(amt)
-        if data:
-            self._sent += len(data)
-            pct = int((self._sent / self._size) * 100)
-            if pct >= self._next_pct:
-                self._logger.info(f"{self._job_tag} {self._step_label} {pct}%")
-                self._next_pct += self._log_step
-        return data
-
-    def __getattr__(self, name):
-        return getattr(self._f, name)
-
-# ---------- Async uploader (YouTube) ----------
+# ---------- YouTube worker ----------
 def async_upload_to_youtube(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags, channel_key, publish_at=None):
     logger = job_logger(job_id)
     try:
-        # Friendly name & download
+        memlog("YT start")
         parsed = urlparse(video_url)
         filename = os.path.basename(parsed.path) or f"video_{job_id}.mp4"
         temp_file = f"temp_{job_id}.mp4"
 
         logger.info(f"[{job_id}] YT job start channel={channel_key} file=\"{filename}\"")
         streamed_download_to_file(logger, video_url, temp_file, f"[{job_id}]")
+        memlog("YT after download")
 
-        # Build YouTube client & request
         yt = get_authenticated_service(channel_key)
         tag_list = [t.strip() for t in (raw_tags or "").split(",") if t.strip()]
 
-        # Decide scheduling
         status_obj = {"privacyStatus": privacy, "madeForKids": False}
         if publish_at:
             try:
@@ -222,7 +219,7 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
                 else:
                     dt = datetime.strptime(publish_at, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
                 if dt > datetime.now(timezone.utc):
-                    status_obj["privacyStatus"] = "private"  # required by YT for scheduling
+                    status_obj["privacyStatus"] = "private"
                     status_obj["publishAt"] = dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
                     logger.info(f"[{job_id}] scheduling for {status_obj['publishAt']}")
                 else:
@@ -230,11 +227,14 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
             except Exception as e:
                 logger.warning(f"[{job_id}] publish_at parse failed: {e}")
 
-        body = {"snippet": {"title": title, "description": description, "tags": tag_list}, "status": status_obj}
-        media = MediaFileUpload(temp_file, mimetype="video/*", resumable=True)
-        req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
+        # 8MB chunks to cap transient memory
+        media = MediaFileUpload(temp_file, mimetype="video/*", resumable=True, chunksize=8 * 1024 * 1024)
+        req = yt.videos().insert(
+            part="snippet,status",
+            body={"snippet": {"title": title, "description": description, "tags": tag_list}, "status": status_obj},
+            media_body=media,
+        )
 
-        # Upload progress (every ~5%)
         last_logged = -5
         progress, status = None, None
         while status is None:
@@ -243,18 +243,24 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
                 pct = int(progress.progress() * 100)
                 if pct - last_logged >= 5:
                     logger.info(f"[{job_id}] upload {pct}%")
+                    memlog(f"YT upload {pct}%")
                     last_logged = pct
 
         video_id = status["id"]
         youtube_url = f"https://youtu.be/{video_id}"
         logger.info(f"[{job_id}] YT upload complete -> {youtube_url}")
+        memlog("YT done")
+        top_allocs("YT done")
 
         # Thumbnail (non-fatal)
         if thumbnail_url:
             try:
                 thumb_file = f"thumb_{job_id}.jpg"
                 streamed_download_to_file(logger, thumbnail_url, thumb_file, f"[{job_id}] thumbnail")
-                yt.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(thumb_file, mimetype="image/jpeg")).execute()
+                yt.thumbnails().set(
+                    videoId=video_id,
+                    media_body=MediaFileUpload(thumb_file, mimetype="image/jpeg")
+                ).execute()
                 try:
                     os.remove(thumb_file)
                 except Exception:
@@ -263,7 +269,6 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
             except Exception as e:
                 logger.warning(f"[{job_id}] thumbnail error (non-fatal): {e}")
 
-        # Cleanup local temp
         try:
             os.remove(temp_file)
         except Exception:
@@ -284,7 +289,6 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
                 logger.warning(f"[{job_id}] Bunny delete exception: {e}")
                 write_status(job_id, {"bunny_delete": {"ok": False, "error": str(e)}})
 
-        # Persist final state
         write_status(
             job_id,
             {
@@ -303,7 +307,7 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
 
 # ---------- WordPress helpers ----------
 def _wp_api_base():
-    base = os.environ.get("WP_API_BASE")  # e.g. https://example.com/wp-json/wp/v2
+    base = os.environ.get("WP_API_BASE")  # e.g. https://mtdcnc.com/wp-json/wp/v2
     if not base:
         raise RuntimeError("Missing env var WP_API_BASE")
     return base.rstrip("/")
@@ -315,55 +319,73 @@ def _wp_auth():
         raise RuntimeError("Missing WP_USER or WP_APP_PASSWORD")
     return HTTPBasicAuth(user, app_pass)
 
-# ---------- Async uploader (WordPress) ----------
+def _progress_cb_factory(logger, job_id):
+    last = {"pct": -10}
+    def cb(monitor: MultipartEncoderMonitor):
+        if monitor.len:
+            pct = int(100 * monitor.bytes_read / monitor.len)
+            if pct - last["pct"] >= 10:
+                logger.info(f"[WP {job_id}] upload {pct}%")
+                memlog(f"WP upload {pct}%")
+                last["pct"] = pct
+    return cb
+
+# ---------- WordPress worker ----------
 def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post_id):
-    """
-    Downloads from Bunny CDN and uploads to WordPress Media Library.
-    Non-fatal on metadata update failure. Persists results to wp_status.json.
-    """
     logger = job_logger(job_id)
     try:
-        # 1) Download Bunny file (with % logs)
+        memlog("WP start")
+
+        # 1) Download Bunny file (streamed)
         temp_path = f"wp_{job_id}"
         logger.info(f"[WP {job_id}] job start file=\"{filename or 'video.mp4'}\"")
         streamed_download_to_file(logger, video_url, temp_path, f"[WP {job_id}]")
+        memlog("WP after download")
 
-        # 2) Upload to WP /media (multipart, with % logs using LoggingFile)
+        # 2) Streamed multipart upload to WP (constant memory)
         api_base = _wp_api_base()
         media_ep = f"{api_base}/media"
         guess, _ = mimetypes.guess_type(filename or "")
         mime = guess or "video/mp4"
         up_name = filename or f"video_{job_id}.mp4"
 
-        file_size = os.path.getsize(temp_path)
         with open(temp_path, "rb") as fh:
-            lf = LoggingFile(fh, file_size, logger, f"[WP {job_id}]", step_label="upload", log_step=10)
-            files = {"file": (up_name, lf, mime)}
-            headers = {"Content-Disposition": f'attachment; filename="{up_name}"'}
+            enc = MultipartEncoder(fields={"file": (up_name, fh, mime)})
+            mon = MultipartEncoderMonitor(enc, _progress_cb_factory(logger, job_id))
+            headers = {
+                "Content-Type": mon.content_type,
+                "Content-Disposition": f'attachment; filename="{up_name}"'
+            }
             logger.info(f"[WP {job_id}] POST {media_ep}")
-            resp = requests.post(media_ep, files=files, headers=headers, auth=_wp_auth(), timeout=900)
+            memlog("WP before POST")
+            t0 = time.time()
+            resp = requests.post(media_ep, data=mon, headers=headers, auth=_wp_auth(), timeout=900)
+            elapsed = time.time() - t0
 
-        logger.info(f"[WP {job_id}] response {resp.status_code}")
+        logger.info(f"[WP {job_id}] response {resp.status_code} in {elapsed:.1f}s")
+        memlog("WP after POST")
 
-        # Try to parse JSON; fall back to raw text
+        # Try to parse JSON; show raw on failure
         resp_json = None
-        resp_text_preview = None
+        preview = None
         try:
             resp_json = resp.json()
         except Exception:
-            resp_text_preview = (resp.text or "")[:1200]
+            preview = (resp.text or "")[:1200]
 
         if not resp.ok:
             if resp_json:
                 logger.error(f"[WP {job_id}] upload failed {resp.status_code}: {json.dumps(resp_json)[:1200]}")
             else:
-                logger.error(f"[WP {job_id}] upload failed {resp.status_code}: {resp_text_preview}")
+                logger.error(f"[WP {job_id}] upload failed {resp.status_code}: {preview}")
             resp.raise_for_status()
 
         media_json = resp_json if resp_json is not None else resp.json()
         attachment_id = media_json.get("id")
         source_url = media_json.get("source_url")
         logger.info(f"[WP {job_id}] upload complete id={attachment_id} url={source_url}")
+        memlog("WP after response")
+        top_allocs("WP done")
 
         # 3) Optional metadata / attach to post (non-fatal)
         if any([title, alt_text, post_id]):
@@ -379,12 +401,11 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
                 logger.info(f"[WP {job_id}] updating media metadata")
                 pr = requests.post(meta_ep, json=patch, auth=_wp_auth(), timeout=120)
                 if not pr.ok:
-                    preview = None
                     try:
-                        preview = json.dumps(pr.json())[:800]
+                        prev = json.dumps(pr.json())[:800]
                     except Exception:
-                        preview = (pr.text or "")[:800]
-                    logger.warning(f"[WP {job_id}] meta update failed {pr.status_code}: {preview}")
+                        prev = (pr.text or "")[:800]
+                    logger.warning(f"[WP {job_id}] meta update failed {pr.status_code}: {prev}")
                 else:
                     logger.info(f"[WP {job_id}] metadata updated")
             except Exception as e:
@@ -432,7 +453,6 @@ def upload_endpoint():
 
     job_id = str(uuid.uuid4())
 
-    # Record initial status for polling
     write_status(
         job_id,
         {
@@ -446,8 +466,8 @@ def upload_endpoint():
 
     app.logger.info(f"[{job_id}] received YT job for channel={channel_key}")
     thread = threading.Thread(
-        target=async_upload_to_youtube,
-        args=(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags, channel_key, publish_at),
+        target=_with_gate,
+        args=(async_upload_to_youtube, job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags, channel_key, publish_at),
         daemon=True,
     )
     thread.start()
@@ -466,18 +486,17 @@ def status_check():
 @app.route("/upload-to-wordpress", methods=["POST"])
 def upload_to_wordpress():
     data = request.json or {}
-    video_url = data.get("video_url")  # Bunny CDN file
-    filename = data.get("filename")    # e.g. "clip.mp4"
-    title = data.get("title")          # optional
-    alt_text = data.get("alt_text")    # optional
-    post_id = data.get("post_id")      # optional
+    video_url = data.get("video_url")
+    filename = data.get("filename")
+    title = data.get("title")
+    alt_text = data.get("alt_text")
+    post_id = data.get("post_id")
 
     if not video_url:
         return jsonify({"error": "Missing video_url"}), 400
 
     job_id = str(uuid.uuid4())
 
-    # Record initial WP status for polling
     wp_write_status(
         job_id,
         {
@@ -489,8 +508,8 @@ def upload_to_wordpress():
 
     app.logger.info(f"[WP {job_id}] received WP job")
     thread = threading.Thread(
-        target=async_upload_to_wordpress,
-        args=(job_id, video_url, filename, title, alt_text, post_id),
+        target=_with_gate,
+        args=(async_upload_to_wordpress, job_id, video_url, filename, title, alt_text, post_id),
         daemon=True,
     )
     thread.start()
@@ -506,6 +525,6 @@ def wp_status():
         return jsonify(entry), 200
     return jsonify({"error": "Not found"}), 404
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET", "HEAD"])
 def health():
     return "YouTube Uploader is live!", 200
