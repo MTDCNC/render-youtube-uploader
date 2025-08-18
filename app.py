@@ -15,6 +15,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.auth.transport.requests import Request
+from zoneinfo import ZoneInfo  # Py3.9+
 
 # Flush logs immediately on Render
 try:
@@ -53,6 +54,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube",
 ]
+
+TZ_BY_CHANNEL = {
+    "UK": ZoneInfo("Europe/London"),
+    "US": ZoneInfo("America/New_York"),   # tweak if needed
+    "Asia": ZoneInfo("Asia/Kolkata"),     # tweak if needed
+}
 
 def select_channel_by_location(location: str) -> str:
     loc = (location or "").lower()
@@ -112,22 +119,31 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
 
         yt = yt_service(channel_key)
         tags = [t.strip() for t in (raw_tags or "").split(",") if t.strip()]
-        status_obj = {"privacyStatus": privacy, "madeForKids": False}
-
+        # Decide scheduling
+        status_obj = {'privacyStatus': privacy, 'madeForKids': False}
+        
         if publish_at:
             try:
-                if publish_at.endswith("Z"):
-                    publish_at = publish_at.replace("Z","+00:00")
-                if "T" in publish_at:
-                    dt = datetime.fromisoformat(publish_at)
+                # Cases:
+                # - RFC3339 with Z/offset -> parse as-is (aware)
+                # - "YYYY-MM-DD HH:mm" (no offset) -> treat as local time for channel
+                if 'T' in publish_at:
+                    dt = datetime.fromisoformat(publish_at.replace('Z', '+00:00'))
                 else:
-                    dt = datetime.strptime(publish_at,"%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-                if dt > datetime.now(timezone.utc):
-                    status_obj["privacyStatus"] = "private"
-                    status_obj["publishAt"] = dt.astimezone(timezone.utc).isoformat().replace("+00:00","Z")
-                    app.logger.info(f"[{job_id}] YT scheduled for {status_obj['publishAt']}")
+                    local_tz = TZ_BY_CHANNEL.get(channel_key, ZoneInfo("UTC"))
+                    naive = datetime.strptime(publish_at, "%Y-%m-%d %H:%M")
+                    dt = naive.replace(tzinfo=local_tz)
+        
+                now_utc = datetime.now(timezone.utc)
+        
+                if dt > now_utc.astimezone(dt.tzinfo):
+                    status_obj['privacyStatus'] = 'private'
+                    status_obj['publishAt'] = dt.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+                    app.logger.info(f"[{job_id}] Scheduled for future publish at {status_obj['publishAt']}")
+                else:
+                    app.logger.info(f"[{job_id}] publish_at is in the past — publishing immediately.")
             except Exception as e:
-                app.logger.warning(f"[{job_id}] publish_at parse failed: {e}")
+                app.logger.warning(f"[{job_id}] Could not parse publish_at '{publish_at}': {e}")
 
         media = MediaFileUpload(tmp, mimetype="video/*", resumable=True, chunksize=8*1024*1024)
         req = yt.videos().insert(
