@@ -360,4 +360,65 @@ def upload_youtube():
 @app.route("/status-check", methods=["GET"])
 def yt_status():
     job_id = request.args.get("job_id")
-    if not job_id: return jsonify({"error":"Missing job_id parameter"}
+    if not job_id: return jsonify({"error":"Missing job_id parameter"}), 400
+    data = read_json(YT_STATUS_FILE, dict).get(job_id)
+    return (jsonify(data),200) if data else (jsonify({"error":"Not found"}),404)
+
+@app.route("/upload-to-wordpress", methods=["POST"])
+def upload_wp():
+    d = request.json or {}
+    video_url = d.get("video_url")
+    if not video_url:
+        return jsonify({"error":"Missing video_url"}), 400
+
+    job_id = str(uuid.uuid4())
+    st = read_json(WP_STATUS_FILE, dict)
+    st[job_id] = {"state":"processing","title": d.get("title"), "started_at": iso_now()}
+    write_json(WP_STATUS_FILE, st)
+
+    threading.Thread(
+        target=async_upload_to_wordpress,
+        args=(job_id, video_url, d.get("filename"), d.get("title"), d.get("alt_text"), d.get("post_id")),
+        daemon=True
+    ).start()
+
+    return jsonify({"status":"processing","job_id":job_id}), 202
+
+@app.route("/wp-status", methods=["GET"])
+def wp_status():
+    job_id = request.args.get("job_id")
+    if not job_id: return jsonify({"error":"Missing job_id parameter"}), 400
+    data = read_json(WP_STATUS_FILE, dict).get(job_id)
+    return (jsonify(data),200) if data else (jsonify({"error":"Not found"}),404)
+
+@app.route("/wp-verify", methods=["GET"])
+def wp_verify():
+    job_id = request.args.get("job_id")
+    if not job_id: return jsonify({"error":"Missing job_id parameter"}), 400
+
+    st_all = read_json(WP_STATUS_FILE, dict)
+    entry = st_all.get(job_id)
+    if not entry:
+        return jsonify({"error":"Not found"}), 404
+    if entry.get("state") == "completed":
+        return jsonify(entry), 200
+
+    token = entry.get("verify_token") or f"job:{job_id}"
+    base  = entry.get("filename_base") or filename_base(entry.get("filename",""))
+    attach_id, url = _wp_find_by_token_or_name(token, base)
+
+    if attach_id and url:
+        entry.update({"state":"completed","attachment_id":attach_id,"source_url":url,"finished_at":iso_now(),"verified_via":"token_or_name"})
+        st_all[job_id] = entry
+        write_json(WP_STATUS_FILE, st_all)
+        return jsonify(entry), 200
+
+    # still processing
+    entry.update({"state":"processing","note":"verify_pending","last_check":iso_now()})
+    st_all[job_id] = entry
+    write_json(WP_STATUS_FILE, st_all)
+    return jsonify(entry), 200
+
+@app.route("/", methods=["GET", "HEAD"])
+def health():
+    return "YouTube Uploader is live!", 200
