@@ -16,6 +16,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.auth.transport.requests import Request
 from zoneinfo import ZoneInfo  # Py3.9+
+import re
 
 # Flush logs immediately on Render
 try:
@@ -55,11 +56,23 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube",
 ]
 
-TZ_BY_CHANNEL = {
-    "UK": ZoneInfo("Europe/London"),
-    "US": ZoneInfo("America/New_York"),   # tweak if needed
-    "Asia": ZoneInfo("Asia/Kolkata"),     # tweak if needed
-}
+UK_TZ = ZoneInfo("Europe/London")
+
+def parse_publish_at_uk(s: str) -> datetime:
+    s = (s or "").strip()
+
+    # If an explicit numeric offset is present (+HH:MM / -HH:MM), respect it.
+    if re.search(r'[+-]\d{2}:\d{2}$', s):
+        return datetime.fromisoformat(s.replace('Z', '+00:00'))
+
+    # Otherwise (no offset OR trailing Z), treat as UK wall time.
+    # Accept "YYYY-MM-DD HH:mm", "YYYY-MM-DDTHH:mm", and optional :ss
+    s_clean = s.replace('T', ' ').rstrip('Z')
+    if len(s_clean) >= 19:
+        dt_naive = datetime.strptime(s_clean[:19], "%Y-%m-%d %H:%M:%S")
+    else:
+        dt_naive = datetime.strptime(s_clean[:16], "%Y-%m-%d %H:%M")
+    return dt_naive.replace(tzinfo=UK_TZ)
 
 def select_channel_by_location(location: str) -> str:
     loc = (location or "").lower()
@@ -120,30 +133,24 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
         yt = yt_service(channel_key)
         tags = [t.strip() for t in (raw_tags or "").split(",") if t.strip()]
         # Decide scheduling
+        # Decide scheduling
         status_obj = {'privacyStatus': privacy, 'madeForKids': False}
         
         if publish_at:
             try:
-                # Cases:
-                # - RFC3339 with Z/offset -> parse as-is (aware)
-                # - "YYYY-MM-DD HH:mm" (no offset) -> treat as local time for channel
-                if 'T' in publish_at:
-                    dt = datetime.fromisoformat(publish_at.replace('Z', '+00:00'))
-                else:
-                    local_tz = TZ_BY_CHANNEL.get(channel_key, ZoneInfo("UTC"))
-                    naive = datetime.strptime(publish_at, "%Y-%m-%d %H:%M")
-                    dt = naive.replace(tzinfo=local_tz)
-        
+                dt = parse_publish_at_uk(publish_at)  # <- always interpret as UK local time
                 now_utc = datetime.now(timezone.utc)
+                dt_utc = dt.astimezone(timezone.utc)
         
-                if dt > now_utc.astimezone(dt.tzinfo):
+                if dt_utc > now_utc:
                     status_obj['privacyStatus'] = 'private'
-                    status_obj['publishAt'] = dt.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
-                    app.logger.info(f"[{job_id}] Scheduled for future publish at {status_obj['publishAt']}")
+                    status_obj['publishAt'] = dt_utc.isoformat().replace('+00:00', 'Z')
+                    app.logger.info(f"[{job_id}] Scheduled (UK wall time) -> {status_obj['publishAt']}")
                 else:
-                    app.logger.info(f"[{job_id}] publish_at is in the past — publishing immediately.")
+                    app.logger.info(f"[{job_id}] publish_at in past — publishing immediately.")
             except Exception as e:
                 app.logger.warning(f"[{job_id}] Could not parse publish_at '{publish_at}': {e}")
+
 
         media = MediaFileUpload(tmp, mimetype="video/*", resumable=True, chunksize=8*1024*1024)
         req = yt.videos().insert(
