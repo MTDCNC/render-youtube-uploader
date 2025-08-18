@@ -1,6 +1,10 @@
 # app.py
-# Async uploads to YouTube & WordPress with robust logging and low-memory streaming.
-# Returns {"status":"processing","job_id":...} immediately to avoid Zapier timeouts.
+# Async uploads to YouTube & WordPress with robust logging, low-memory streaming,
+# and post-504 verification for WordPress.
+#
+# Add to requirements.txt:
+#   requests-toolbelt
+#   psutil
 
 from flask import Flask, request, jsonify, g, has_request_context
 import os
@@ -90,7 +94,7 @@ def top_allocs(tag: str, limit=5):
     except Exception:
         pass
 
-# ---------- throttle: one heavy job at a time (prevents double RAM spikes) ----------
+# ---------- throttle: one heavy job at a time ----------
 JOB_SEM = threading.Semaphore(1)
 
 def _with_gate(fn, *args, **kwargs):
@@ -102,8 +106,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube",
 ]
-STATUS_FILENAME = "youtube_status.json"   # ephemeral (as requested)
-WP_STATUS_FILENAME = "wp_status.json"     # ephemeral (as requested)
+STATUS_FILENAME = "youtube_status.json"   # ephemeral as requested
+WP_STATUS_FILENAME = "wp_status.json"     # ephemeral as requested
 
 def select_channel_by_location(location: str) -> str:
     loc = (location or "").lower()
@@ -227,8 +231,9 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
             except Exception as e:
                 logger.warning(f"[{job_id}] publish_at parse failed: {e}")
 
-        # 8MB chunks to cap transient memory
-        media = MediaFileUpload(temp_file, mimetype="video/*", resumable=True, chunksize=8 * 1024 * 1024)
+        media = MediaFileUpload(
+            temp_file, mimetype="video/*", resumable=True, chunksize=8 * 1024 * 1024
+        )
         req = yt.videos().insert(
             part="snippet,status",
             body={"snippet": {"title": title, "description": description, "tags": tag_list}, "status": status_obj},
@@ -252,7 +257,6 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
         memlog("YT done")
         top_allocs("YT done")
 
-        # Thumbnail (non-fatal)
         if thumbnail_url:
             try:
                 thumb_file = f"thumb_{job_id}.jpg"
@@ -261,20 +265,15 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
                     videoId=video_id,
                     media_body=MediaFileUpload(thumb_file, mimetype="image/jpeg")
                 ).execute()
-                try:
-                    os.remove(thumb_file)
-                except Exception:
-                    pass
+                try: os.remove(thumb_file)
+                except Exception: pass
                 logger.info(f"[{job_id}] thumbnail set")
             except Exception as e:
                 logger.warning(f"[{job_id}] thumbnail error (non-fatal): {e}")
 
-        try:
-            os.remove(temp_file)
-        except Exception:
-            pass
+        try: os.remove(temp_file)
+        except Exception: pass
 
-        # Bunny delete (non-fatal)
         if bunny_delete_url:
             try:
                 logger.info(f"[{job_id}] deleting source from Bunny temp storage")
@@ -330,8 +329,70 @@ def _progress_cb_factory(logger, job_id):
                 last["pct"] = pct
     return cb
 
+# ---- New: helpers to verify after a 504 from proxy/WP ----
+def _wp_search_media(logger, query: str):
+    """Search WP media by title/slug; returns list (may be empty)."""
+    api_base = _wp_api_base()
+    params = {"search": query, "per_page": 10, "orderby": "date", "order": "desc"}
+    try:
+        r = requests.get(f"{api_base}/media", params=params, auth=_wp_auth(), timeout=60)
+        if not r.ok:
+            preview = None
+            try: preview = json.dumps(r.json())[:400]
+            except Exception: preview = (r.text or "")[:400]
+            logger.warning(f"[WP search] {r.status_code}: {preview}")
+            return []
+        return r.json()
+    except Exception as e:
+        logger.warning(f"[WP search] request failed: {e}")
+        return []
+
+def _sanitize_base(name: str) -> str:
+    base = os.path.splitext(name or "")[0].lower()
+    return base.replace("_", "-").replace(" ", "-")
+
+def _verify_after_504(logger, job_id, up_name, title):
+    """Poll WP after a 504 to confirm whether the media actually landed."""
+    query = (title or _sanitize_base(up_name)) or up_name
+    deadline = time.time() + 10 * 60  # up to 10 minutes
+    while time.time() < deadline:
+        items = _wp_search_media(logger, query)
+        base = _sanitize_base(up_name)
+        for it in items:
+            src = (it.get("source_url") or "").lower()
+            it_title = (it.get("title", {}).get("rendered") or "")
+            if base in src or (title and title.lower() in it_title.lower()):
+                attach_id = it.get("id")
+                url = it.get("source_url")
+                logger.info(f"[WP {job_id}] verified after 504: id={attach_id} url={url}")
+                wp_write_status(job_id, {
+                    "state": "completed",
+                    "attachment_id": attach_id,
+                    "source_url": url,
+                    "finished_at": now_utc_iso(),
+                    "verified_after_504": True,
+                })
+                return True
+        wp_write_status(job_id, {
+            "state": "processing",
+            "note": "verifying after 504",
+            "last_check": now_utc_iso(),
+        })
+        time.sleep(30)
+    wp_write_status(job_id, {
+        "state": "error",
+        "error": "WP returned 504 and media not visible after verification window",
+        "finished_at": now_utc_iso(),
+    })
+    logger.error(f"[WP {job_id}] 504 then verify failed (not found)")
+    return False
+
 # ---------- WordPress worker ----------
 def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post_id):
+    """
+    Downloads from Bunny CDN and uploads to WordPress Media Library.
+    On 504, automatically verifies whether the media landed and updates status accordingly.
+    """
     logger = job_logger(job_id)
     try:
         memlog("WP start")
@@ -350,7 +411,10 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
         up_name = filename or f"video_{job_id}.mp4"
 
         with open(temp_path, "rb") as fh:
-            enc = MultipartEncoder(fields={"file": (up_name, fh, mime)})
+            enc = MultipartEncoder(fields={
+                "file": (up_name, fh, mime),
+                "title": title or up_name,   # helps later search/verification
+            })
             mon = MultipartEncoderMonitor(enc, _progress_cb_factory(logger, job_id))
             headers = {
                 "Content-Type": mon.content_type,
@@ -373,6 +437,21 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
         except Exception:
             preview = (resp.text or "")[:1200]
 
+        # --- SPECIAL CASE: 504 (proxy timeout while WP may still process) ---
+        if resp.status_code == 504:
+            logger.warning(f"[WP {job_id}] 504 from proxy while WP likely still processing; starting verification loop")
+            wp_write_status(job_id, {
+                "state": "processing",
+                "note": "received 504; verifying on server",
+                "started_at": wp_load_status().get(job_id, {}).get("started_at", now_utc_iso()),
+            })
+            _verify_after_504(logger, job_id, up_name, title)
+            # done: status is now completed or error
+            try: os.remove(temp_path)
+            except Exception: pass
+            return
+
+        # --- Normal non-OK errors ---
         if not resp.ok:
             if resp_json:
                 logger.error(f"[WP {job_id}] upload failed {resp.status_code}: {json.dumps(resp_json)[:1200]}")
@@ -380,6 +459,7 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
                 logger.error(f"[WP {job_id}] upload failed {resp.status_code}: {preview}")
             resp.raise_for_status()
 
+        # --- Success path ---
         media_json = resp_json if resp_json is not None else resp.json()
         attachment_id = media_json.get("id")
         source_url = media_json.get("source_url")
@@ -387,35 +467,28 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
         memlog("WP after response")
         top_allocs("WP done")
 
-        # 3) Optional metadata / attach to post (non-fatal)
+        # Optional metadata / attach to post (non-fatal)
         if any([title, alt_text, post_id]):
             patch = {}
-            if title:
-                patch["title"] = title
-            if alt_text:
-                patch["alt_text"] = alt_text
-            if post_id:
-                patch["post"] = int(post_id)
+            if title:    patch["title"] = title
+            if alt_text: patch["alt_text"] = alt_text
+            if post_id:  patch["post"] = int(post_id)
             try:
                 meta_ep = f"{api_base}/media/{attachment_id}"
                 logger.info(f"[WP {job_id}] updating media metadata")
                 pr = requests.post(meta_ep, json=patch, auth=_wp_auth(), timeout=120)
                 if not pr.ok:
-                    try:
-                        prev = json.dumps(pr.json())[:800]
-                    except Exception:
-                        prev = (pr.text or "")[:800]
+                    try: prev = json.dumps(pr.json())[:800]
+                    except Exception: prev = (pr.text or "")[:800]
                     logger.warning(f"[WP {job_id}] meta update failed {pr.status_code}: {prev}")
                 else:
                     logger.info(f"[WP {job_id}] metadata updated")
             except Exception as e:
                 logger.warning(f"[WP {job_id}] meta update exception: {e}")
 
-        # 4) Cleanup temp, save status
-        try:
-            os.remove(temp_path)
-        except Exception:
-            pass
+        # Cleanup temp, save status
+        try: os.remove(temp_path)
+        except Exception: pass
 
         wp_write_status(
             job_id,
