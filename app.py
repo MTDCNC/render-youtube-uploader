@@ -48,7 +48,6 @@ def pjoin(*parts):
 
 # Ephemeral files (by design; no disk requirement)
 YT_STATUS_FILE = "youtube_status.json"
-WP_STATUS_FILE = "wp_status.json"
 
 # --------- YouTube helpers ---------
 SCOPES = [
@@ -413,26 +412,6 @@ def yt_status():
     if not job_id: return jsonify({"error":"Missing job_id parameter"}), 400
     data = read_json(YT_STATUS_FILE, dict).get(job_id)
     return (jsonify(data),200) if data else (jsonify({"error":"Not found"}),404)
-
-@app.route("/upload-to-wordpress", methods=["POST"])
-def upload_wp():
-    d = request.json or {}
-    video_url = d.get("video_url")
-    if not video_url:
-        return jsonify({"error":"Missing video_url"}), 400
-
-    job_id = str(uuid.uuid4())
-    st = read_json(WP_STATUS_FILE, dict)
-    st[job_id] = {"state":"processing","title": d.get("title"), "started_at": iso_now()}
-    write_json(WP_STATUS_FILE, st)
-
-    threading.Thread(
-        target=async_upload_to_wordpress,
-        args=(job_id, video_url, d.get("filename"), d.get("title"), d.get("alt_text"), d.get("post_id")),
-        daemon=True
-    ).start()
-
-    return jsonify({"status":"processing","job_id":job_id}), 202
 
 
 @app.route("/", methods=["GET", "HEAD"])
