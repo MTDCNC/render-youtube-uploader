@@ -205,7 +205,7 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
         st[job_id] = {"state":"error","error":str(e),"finished_at":iso_now()}
         write_json(YT_STATUS_FILE, st)
 
-# --------- WordPress helpers ---------
+# --------- WordPress helpers (no local status file) ---------
 def wp_api_base():
     base = os.environ.get("WP_API_BASE")  # e.g. https://example.com/wp-json/wp/v2
     if not base:
@@ -224,11 +224,12 @@ def filename_base(name: str) -> str:
 
 # --------- WordPress worker (streaming, low RAM) ---------
 def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post_id):
+    """Download from Bunny and upload to WP Media. We DO NOT write local state; WP is the ledger."""
+    tmp = None
     try:
         up_name = filename or f"video_{job_id}.mp4"
         tmp = f"wp_{job_id}"
         app.logger.info(f"[WP {job_id}] start file=\"{up_name}\"")
-
         # 1) download from Bunny (streamed)
         streamed_download(video_url, tmp, f"[WP {job_id}]")
 
@@ -250,20 +251,18 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
             enc = MultipartEncoder(fields={
                 "file": (up_name, fh, mime),
                 "title": title or up_name,
-                "description": f"Uploaded by automation ({token})",
-                # alt_text / post can be set after creation to keep payload tiny
+                "description": f"Uploaded by automation ({token})",  # <- searchable stamp
             })
             mon = MultipartEncoderMonitor(enc, _progress)
-            headers = {"Content-Type": mon.content_type,
-                       "Content-Disposition": f'attachment; filename="{up_name}"'}
+            headers = {
+                "Content-Type": mon.content_type,
+                "Content-Disposition": f'attachment; filename="{up_name}"'
+            }
             app.logger.info(f"[WP {job_id}] POST {media_ep}")
             t0 = time.time()
             resp = requests.post(media_ep, data=mon, headers=headers, auth=wp_auth(), timeout=900)
-            elapsed = time.time() - t0
+            app.logger.info(f"[WP {job_id}] response {resp.status_code} in {time.time()-t0:.1f}s")
 
-        app.logger.info(f"[WP {job_id}] response {resp.status_code} in {elapsed:.1f}s")
-
-        # 3) handle response
         if resp.status_code == 201:
             data = resp.json()
             attach_id, src = data.get("id"), data.get("source_url")
@@ -279,76 +278,104 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
                 except Exception as e:
                     app.logger.warning(f"[WP {job_id}] meta patch failed: {e}")
 
-            st = read_json(WP_STATUS_FILE, dict)
-            st[job_id] = {"state":"completed","attachment_id":attach_id,"source_url":src,
-                          "finished_at":iso_now(),"filename":up_name}
-            write_json(WP_STATUS_FILE, st)
-
         elif resp.status_code == 504:
-            # proxy timeout – WP may still be processing.
-            app.logger.warning(f"[WP {job_id}] 504 proxy timeout; defer verify to /wp-verify")
-            st = read_json(WP_STATUS_FILE, dict)
-            st[job_id] = {
-                "state":"processing",
-                "note":"proxy_timeout_504",
-                "verify_token": token,
-                "filename": up_name,
-                "filename_base": filename_base(up_name),
-                "title": title or up_name,
-                "started_at": iso_now(),
-            }
-            write_json(WP_STATUS_FILE, st)
+            # Proxy timeout — WordPress may still finish. We'll find it later via /wp-status-by-job.
+            app.logger.warning(f"[WP {job_id}] 504 proxy timeout (will rely on /wp-status-by-job)")
 
         else:
             try:
-                preview = json.dumps(resp.json())[:1200]
+                preview = json.dumps(resp.json())[:600]
             except Exception:
-                preview = (resp.text or "")[:1200]
+                preview = (resp.text or "")[:600]
             app.logger.error(f"[WP {job_id}] upload failed {resp.status_code}: {preview}")
-            st = read_json(WP_STATUS_FILE, dict)
-            st[job_id] = {"state":"error","error":f"{resp.status_code}: {preview}","finished_at":iso_now()}
-            write_json(WP_STATUS_FILE, st)
 
     except Exception as e:
         app.logger.error(f"[WP {job_id}] error: {e}")
-        st = read_json(WP_STATUS_FILE, dict)
-        st[job_id] = {"state":"error","error":str(e),"finished_at":iso_now()}
-        write_json(WP_STATUS_FILE, st)
     finally:
-        try: os.remove(tmp)
-        except Exception: pass
+        try:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
-# --------- Minimal verify (Zap calls this once after its Delay) ---------
-def _wp_find_by_token_or_name(token: str, name_base: str):
-    """Single lookup: prefer the unique token, fall back to recent scan by filename base."""
-    api = wp_api_base()
-    auth = wp_auth()
+# --------- Lookup: find WP media by Render job_id (searches Description stamp) ---------
+@app.route('/wp-status-by-job', methods=['GET'])
+def wp_status_by_job():
+    """
+    GET /wp-status-by-job?job_id=...
+    Searches WP Media for an item whose description/title contains 'job:<job_id>'.
+    Returns 200 with {attachment_id, source_url, filename} when found,
+    or 202 while still processing.
+    """
+    job_id = (request.args.get('job_id') or '').strip()
+    if not job_id:
+        return jsonify({'error': 'Missing job_id parameter'}), 400
 
-    # 1) token search (fast & unique)
+    token = f"job:{job_id}"
     try:
-        r = requests.get(f"{api}/media", params={"search": token, "per_page": 25, "orderby":"id","order":"desc"}, auth=auth, timeout=60)
-        if r.ok:
-            items = r.json()
-            for it in items:
-                desc = (it.get("description",{}) or {}).get("rendered","").lower()
-                tit  = (it.get("title",{}) or {}).get("rendered","").lower()
-                if token in desc or token in tit:
-                    return it.get("id"), it.get("source_url")
-    except Exception:
-        pass
+        api = wp_api_base()
+        auth = wp_auth()
 
-    # 2) recent items by id desc, match filename base in URL (no collisions with token)
-    try:
-        r = requests.get(f"{api}/media", params={"per_page": 50, "orderby":"id","order":"desc"}, auth=auth, timeout=60)
-        if r.ok:
-            for it in r.json():
-                url = (it.get("source_url") or "").lower()
-                if name_base and name_base in url.lower():
-                    return it.get("id"), it.get("source_url")
-    except Exception:
-        pass
+        def match(m):
+            desc = ((m.get('description') or {}).get('rendered') or '')
+            tit  = ((m.get('title') or {}).get('rendered') or '')
+            cap  = ((m.get('caption') or {}).get('rendered') or '')
+            hay  = " ".join([desc, tit, cap])
+            return (token in hay) or (job_id in hay)
 
-    return None, None
+        # Pass 1: direct search (fast)
+        r = requests.get(
+            f"{api}/media",
+            params={'search': job_id, 'per_page': 20, 'orderby': 'date', 'order': 'desc'},
+            auth=auth, timeout=60
+        )
+        r.raise_for_status()
+        for m in (r.json() if isinstance(r.json(), list) else []):
+            if match(m):
+                return jsonify({
+                    'state': 'completed',
+                    'attachment_id': m.get('id'),
+                    'source_url': m.get('source_url'),
+                    'filename': ((m.get('media_details') or {}).get('file')) or m.get('slug')
+                }), 200
+
+        # Pass 2: recent items (handles brief search-index lag)
+        r2 = requests.get(
+            f"{api}/media",
+            params={'per_page': 20, 'orderby': 'date', 'order': 'desc'},
+            auth=auth, timeout=60
+        )
+        r2.raise_for_status()
+        for m in (r2.json() if isinstance(r2.json(), list) else []):
+            if match(m):
+                return jsonify({
+                    'state': 'completed',
+                    'attachment_id': m.get('id'),
+                    'source_url': m.get('source_url'),
+                    'filename': ((m.get('media_details') or {}).get('file')) or m.get('slug')
+                }), 200
+
+        return jsonify({'state': 'processing', 'note': 'not found yet'}), 202
+
+    except Exception as e:
+        return jsonify({'state': 'error', 'error': str(e)}), 500
+
+# --------- Routes (keep these) ---------
+@app.route("/upload-to-wordpress", methods=["POST"])
+def upload_wp():
+    d = request.json or {}
+    video_url = d.get("video_url")
+    if not video_url:
+        return jsonify({"error":"Missing video_url"}), 400
+
+    job_id = str(uuid.uuid4())
+    threading.Thread(
+        target=async_upload_to_wordpress,
+        args=(job_id, video_url, d.get("filename"), d.get("title"), d.get("alt_text"), d.get("post_id")),
+        daemon=True
+    ).start()
+    return jsonify({"status":"processing","job_id":job_id}), 202
+
 
 # --------- Routes ---------
 @app.route("/upload-to-youtube", methods=["POST"])
@@ -407,40 +434,6 @@ def upload_wp():
 
     return jsonify({"status":"processing","job_id":job_id}), 202
 
-@app.route("/wp-status", methods=["GET"])
-def wp_status():
-    job_id = request.args.get("job_id")
-    if not job_id: return jsonify({"error":"Missing job_id parameter"}), 400
-    data = read_json(WP_STATUS_FILE, dict).get(job_id)
-    return (jsonify(data),200) if data else (jsonify({"error":"Not found"}),404)
-
-@app.route("/wp-verify", methods=["GET"])
-def wp_verify():
-    job_id = request.args.get("job_id")
-    if not job_id: return jsonify({"error":"Missing job_id parameter"}), 400
-
-    st_all = read_json(WP_STATUS_FILE, dict)
-    entry = st_all.get(job_id)
-    if not entry:
-        return jsonify({"error":"Not found"}), 404
-    if entry.get("state") == "completed":
-        return jsonify(entry), 200
-
-    token = entry.get("verify_token") or f"job:{job_id}"
-    base  = entry.get("filename_base") or filename_base(entry.get("filename",""))
-    attach_id, url = _wp_find_by_token_or_name(token, base)
-
-    if attach_id and url:
-        entry.update({"state":"completed","attachment_id":attach_id,"source_url":url,"finished_at":iso_now(),"verified_via":"token_or_name"})
-        st_all[job_id] = entry
-        write_json(WP_STATUS_FILE, st_all)
-        return jsonify(entry), 200
-
-    # still processing
-    entry.update({"state":"processing","note":"verify_pending","last_check":iso_now()})
-    st_all[job_id] = entry
-    write_json(WP_STATUS_FILE, st_all)
-    return jsonify(entry), 200
 
 @app.route("/", methods=["GET", "HEAD"])
 def health():
