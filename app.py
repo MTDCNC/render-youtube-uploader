@@ -1,7 +1,7 @@
-# app.py — minimal, low-memory uploader (YouTube + WordPress) with simple 504 verification.
+# app.py — minimal, low-memory uploader (YouTube + WordPress) with simple 504 verification + structured JSON logs.
 
 from flask import Flask, request, jsonify
-import os, sys, json, uuid, threading, time, mimetypes
+import os, sys, json, uuid, threading, time, mimetypes, logging
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -26,7 +26,7 @@ except Exception:
 
 app = Flask(__name__)
 
-# --------- tiny utils ---------
+# ---------------- tiny utils ----------------
 def iso_now():
     return datetime.utcnow().isoformat() + "Z"
 
@@ -49,7 +49,29 @@ def pjoin(*parts):
 # Ephemeral files (by design; no disk requirement)
 YT_STATUS_FILE = "youtube_status.json"
 
-# --------- YouTube helpers ---------
+# ---------------- structured logging helpers ----------------
+def setup_logging():
+    root = logging.getLogger()
+    lvl = os.getenv("LOG_LEVEL", "INFO").upper()
+    root.setLevel(lvl)
+    h = logging.StreamHandler()  # stdout -> visible in Render Logs
+    h.setFormatter(logging.Formatter('%(message)s'))  # we emit JSON ourselves
+    root.handlers = [h]
+
+setup_logging()
+
+def jlog(event, **fields):
+    """Emit one JSON log line; searchable in Render. Always includes ts + event.
+    Common fields you may pass: job_id, filename, pct, status, reason, youtube_url, attachment_id
+    """
+    try:
+        payload = {"ts": iso_now(), "event": event, **fields}
+        logging.getLogger("json").info(json.dumps(payload, ensure_ascii=False))
+    except Exception as _:
+        # Never let logging crash the worker
+        pass
+
+# ---------------- YouTube helpers ----------------
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube",
@@ -99,57 +121,69 @@ def yt_service(channel_key: str):
         creds.refresh(Request())
     except RefreshError as e:
         app.logger.error(f"[YT] OAuth refresh failed for {channel_key}: {e}")
+        jlog("yt.oauth.error", channel=channel_key, reason=str(e))
         raise
     return build("youtube", "v3", credentials=creds)
 
-def streamed_download(url: str, dest_path: str, log_prefix: str, chunk=1_048_576):
+# ---------------- Downloader with progress callback ----------------
+def streamed_download(url: str, dest_path: str, log_prefix: str, chunk=1_048_576, on_progress=None):
     with requests.get(url, stream=True) as r:
         r.raise_for_status()
         total = int(r.headers.get("Content-Length", "0")) or None
         next_pct, read = 0, 0
         with open(dest_path, "wb") as f:
             for c in r.iter_content(chunk):
-                if not c: continue
+                if not c: 
+                    continue
                 f.write(c)
                 if total:
                     read += len(c)
                     pct = int(read*100/total)
                     if pct >= next_pct:
                         app.logger.info(f"{log_prefix} download {pct}%")
+                        if on_progress:
+                            try: on_progress(pct)
+                            except Exception: pass
                         next_pct += 10
     app.logger.info(f"{log_prefix} download complete -> {dest_path}")
 
-# --------- YouTube worker ---------
+# ---------------- YouTube worker ----------------
 def async_upload_to_youtube(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags, channel_key, publish_at=None):
+    filename = None
     try:
         parsed = urlparse(video_url)
         filename = os.path.basename(parsed.path) or f"video_{job_id}.mp4"
         tmp = f"yt_{job_id}.mp4"
 
         app.logger.info(f"[{job_id}] YT start file=\"{filename}\" channel={channel_key}")
-        streamed_download(video_url, tmp, f"[{job_id}]")
+        jlog("yt.start", job_id=job_id, filename=filename, channel=channel_key, title=title)
+
+        # Download from Bunny with JSON progress
+        streamed_download(
+            video_url, tmp, f"[{job_id}]",
+            on_progress=lambda p: jlog("yt.download.progress", job_id=job_id, filename=filename, pct=p)
+        )
 
         yt = yt_service(channel_key)
         tags = [t.strip() for t in (raw_tags or "").split(",") if t.strip()]
-        # Decide scheduling
+
         # Decide scheduling
         status_obj = {'privacyStatus': privacy, 'madeForKids': False}
-        
         if publish_at:
             try:
-                dt = parse_publish_at_uk(publish_at)  # <- always interpret as UK local time
+                dt = parse_publish_at_uk(publish_at)  # UK wall time
                 now_utc = datetime.now(timezone.utc)
                 dt_utc = dt.astimezone(timezone.utc)
-        
                 if dt_utc > now_utc:
                     status_obj['privacyStatus'] = 'private'
                     status_obj['publishAt'] = dt_utc.isoformat().replace('+00:00', 'Z')
                     app.logger.info(f"[{job_id}] Scheduled (UK wall time) -> {status_obj['publishAt']}")
+                    jlog("yt.schedule", job_id=job_id, filename=filename, publishAt=status_obj['publishAt'])
                 else:
-                    app.logger.info(f"[{job_id}] publish_at in past — publishing immediately.")
+                    jlog("yt.schedule.skip", job_id=job_id, filename=filename, reason="publish_at_in_past")
             except Exception as e:
                 app.logger.warning(f"[{job_id}] Could not parse publish_at '{publish_at}': {e}")
-
+                jlog("yt.schedule.error", job_id=job_id, filename=filename, reason=str(e))
 
         media = MediaFileUpload(tmp, mimetype="video/*", resumable=True, chunksize=8*1024*1024)
         req = yt.videos().insert(
@@ -166,45 +200,61 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
                 pct = int(progress.progress()*100)
                 if pct - last >= 5:
                     app.logger.info(f"[{job_id}] YT upload {pct}%")
+                    jlog("yt.upload.progress", job_id=job_id, filename=filename, pct=pct)
                     last = pct
 
         vid = status["id"]
         url = f"https://youtu.be/{vid}"
         app.logger.info(f"[{job_id}] YT done -> {url}")
+        jlog("yt.done", job_id=job_id, filename=filename, video_id=vid, youtube_url=url)
 
+        # Thumbnail (non-fatal)
         if thumbnail_url:
             try:
                 thf = f"yt_thumb_{job_id}.jpg"
-                streamed_download(thumbnail_url, thf, f"[{job_id}] thumb")
+                streamed_download(thumbnail_url, thf, f"[{job_id}] thumb",
+                                  on_progress=lambda p: jlog("yt.thumb.download.progress", job_id=job_id, pct=p))
                 yt.thumbnails().set(videoId=vid, media_body=MediaFileUpload(thf, mimetype="image/jpeg")).execute()
                 try: os.remove(thf)
                 except: pass
                 app.logger.info(f"[{job_id}] YT thumbnail set")
+                jlog("yt.thumb.done", job_id=job_id)
             except Exception as e:
                 app.logger.warning(f"[{job_id}] YT thumbnail error: {e}")
+                jlog("yt.thumb.error", job_id=job_id, reason=str(e))
 
-        try: os.remove(tmp)
-        except: pass
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
 
         # Bunny delete is optional; non-fatal
         if bunny_delete_url:
             try:
                 dr = requests.delete(bunny_delete_url, headers={"AccessKey": os.environ.get("BUNNY_API_KEY")})
                 app.logger.info(f"[{job_id}] Bunny delete -> {dr.status_code}")
+                if dr.status_code == 200:
+                    jlog("bunny.delete.success", job_id=job_id)
+                else:
+                    jlog("bunny.delete.failed", job_id=job_id, status_code=dr.status_code, body=(dr.text or "")[:300])
             except Exception as e:
                 app.logger.warning(f"[{job_id}] Bunny delete failed: {e}")
+                jlog("bunny.delete.error", job_id=job_id, reason=str(e))
 
+        # Write status file with success
         st = read_json(YT_STATUS_FILE, dict)
         st[job_id] = {"state":"completed","youtube_url":url,"finished_at":iso_now(),"channel":channel_key,"source_filename":filename}
         write_json(YT_STATUS_FILE, st)
+        jlog("yt.final", job_id=job_id, filename=filename, status="success", youtube_url=url)
 
     except Exception as e:
         app.logger.error(f"[{job_id}] YT error: {e}")
+        jlog("yt.error", job_id=job_id, filename=filename, reason=str(e))
         st = read_json(YT_STATUS_FILE, dict)
         st[job_id] = {"state":"error","error":str(e),"finished_at":iso_now()}
         write_json(YT_STATUS_FILE, st)
 
-# --------- WordPress helpers (no local status file) ---------
+# ---------------- WordPress helpers (no local status file) ----------------
 def wp_api_base():
     base = os.environ.get("WP_API_BASE")  # e.g. https://example.com/wp-json/wp/v2
     if not base:
@@ -221,16 +271,20 @@ def filename_base(name: str) -> str:
     base = os.path.splitext(name or "")[0]
     return "-".join([s for s in base.replace("_","-").replace(" ","-").lower().split("-") if s])
 
-# --------- WordPress worker (streaming, low RAM) ---------
+# ---------------- WordPress worker (streaming, low RAM) ----------------
 def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post_id):
     """Download from Bunny and upload to WP Media. We DO NOT write local state; WP is the ledger."""
     tmp = None
+    up_name = None
     try:
         up_name = filename or f"video_{job_id}.mp4"
         tmp = f"wp_{job_id}"
         app.logger.info(f"[WP {job_id}] start file=\"{up_name}\"")
+        jlog("wp.start", job_id=job_id, filename=up_name, title=title)
+
         # 1) download from Bunny (streamed)
-        streamed_download(video_url, tmp, f"[WP {job_id}]")
+        streamed_download(video_url, tmp, f"[WP {job_id}]",
+                          on_progress=lambda p: jlog("wp.download.progress", job_id=job_id, filename=up_name, pct=p))
 
         # 2) stream multipart to WP with a unique verify token in description
         token = f"job:{job_id}"
@@ -240,10 +294,12 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
         mime = guess or "video/mp4"
 
         def _progress(m: MultipartEncoderMonitor, last=[-10]):
-            if not m.len: return
+            if not m.len:
+                return
             pct = int(100 * m.bytes_read / m.len)
             if pct - last[0] >= 10:
                 app.logger.info(f"[WP {job_id}] upload {pct}%")
+                jlog("wp.upload.progress", job_id=job_id, filename=up_name, pct=pct)
                 last[0] = pct
 
         with open(tmp, "rb") as fh:
@@ -266,6 +322,7 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
             data = resp.json()
             attach_id, src = data.get("id"), data.get("source_url")
             app.logger.info(f"[WP {job_id}] done id={attach_id} url={src}")
+            jlog("wp.done", job_id=job_id, attachment_id=attach_id, url=src)
 
             # optional metadata patch (tiny request)
             if any([alt_text, post_id]):
@@ -276,10 +333,12 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
                     requests.post(f"{api}/media/{attach_id}", json=patch, auth=wp_auth(), timeout=120)
                 except Exception as e:
                     app.logger.warning(f"[WP {job_id}] meta patch failed: {e}")
+                    jlog("wp.meta.error", job_id=job_id, reason=str(e))
 
         elif resp.status_code == 504:
             # Proxy timeout — WordPress may still finish. We'll find it later via /wp-status-by-job.
             app.logger.warning(f"[WP {job_id}] 504 proxy timeout (will rely on /wp-status-by-job)")
+            jlog("wp.timeout", job_id=job_id, reason="504 proxy timeout")
 
         else:
             try:
@@ -287,9 +346,11 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
             except Exception:
                 preview = (resp.text or "")[:600]
             app.logger.error(f"[WP {job_id}] upload failed {resp.status_code}: {preview}")
+            jlog("wp.error", job_id=job_id, filename=up_name, status_code=resp.status_code, reason=preview)
 
     except Exception as e:
         app.logger.error(f"[WP {job_id}] error: {e}")
+        jlog("wp.error", job_id=job_id, filename=up_name, reason=str(e))
     finally:
         try:
             if tmp and os.path.exists(tmp):
@@ -297,7 +358,7 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
         except Exception:
             pass
 
-# --------- Lookup: find WP media by Render job_id (searches Description stamp) ---------
+# ---------------- Lookup: find WP media by Render job_id (searches Description stamp) ----------------
 @app.route('/wp-status-by-job', methods=['GET'])
 def wp_status_by_job():
     """
@@ -359,7 +420,7 @@ def wp_status_by_job():
     except Exception as e:
         return jsonify({'state': 'error', 'error': str(e)}), 500
 
-# --------- Routes (keep these) ---------
+# ---------------- Routes (keep these) ----------------
 @app.route("/upload-to-wordpress", methods=["POST"])
 def upload_wp():
     d = request.json or {}
@@ -376,7 +437,7 @@ def upload_wp():
     return jsonify({"status":"processing","job_id":job_id}), 202
 
 
-# --------- Routes ---------
+# ---------------- YouTube routes ----------------
 @app.route("/upload-to-youtube", methods=["POST"])
 def upload_youtube():
     d = request.json or {}
@@ -397,6 +458,8 @@ def upload_youtube():
     st = read_json(YT_STATUS_FILE, dict)
     st[job_id] = {"state":"processing","channel":channel_key,"title":title,"started_at":iso_now()}
     write_json(YT_STATUS_FILE, st)
+
+    jlog("yt.enqueued", job_id=job_id, title=title, channel=channel_key)
 
     threading.Thread(
         target=async_upload_to_youtube,
