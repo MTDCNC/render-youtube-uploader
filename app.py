@@ -96,16 +96,49 @@ def parse_publish_at_uk(s: str) -> datetime:
     return dt_naive.replace(tzinfo=UK_TZ)
 
 def select_channel_by_location(location: str) -> str:
-    loc = (location or "").lower()
-    if "united kingdom" in loc: return "UK"
-    if "north america" in loc:  return "US"
-    if "asia" in loc:           return "Asia"
+    """
+    Priority: UK → US → Spain → Asia
+    - Exact values come from Monday.com dropdowns.
+    - Supports multi-select strings (comma/newline separated).
+    - Default: UK if nothing relevant is selected.
+    """
+    text = (location or "").strip().lower()
+
+    # Split on commas and newlines to support multi-select fields
+    parts = [p.strip() for p in re.split(r'[,\n]+', text) if p.strip()]
+
+    # Normalise to canonical tokens
+    canon = set()
+    for p in parts:
+        if p == "united kingdom":
+            canon.add("UK")
+        elif p == "north america":
+            canon.add("US")
+        elif p == "north america (spanish)":
+            canon.add("ES")     # route to Spain channel
+        elif p == "asia":
+            canon.add("Asia")
+        # Europe, Middle East, South America → ignored (fall through to default)
+
+    # Priority: UK → US → Spain → Asia
+    if "UK" in canon:
+        return "UK"
+    if "US" in canon:
+        return "US"
+    if "ES" in canon:
+        return "Spain"
+    if "Asia" in canon:
+        return "Asia"
+
+    # Default if only Europe/Middle East/South America/empty/etc.
     return "UK"
+
 
 def yt_service(channel_key: str):
     mapping = {
         "UK":   ("YT_UK_CLIENT_ID", "YT_UK_CLIENT_SECRET", "YT_UK_REFRESH_TOKEN"),
         "US":   ("YT_US_CLIENT_ID", "YT_US_CLIENT_SECRET", "YT_US_REFRESH_TOKEN"),
+        "Spain": ("YT_ES_CLIENT_ID", "YT_ES_CLIENT_SECRET", "YT_ES_REFRESH_TOKEN"),
         "Asia": ("YT_ASIA_CLIENT_ID", "YT_ASIA_CLIENT_SECRET", "YT_ASIA_REFRESH_TOKEN"),
     }
     cid_key, csec_key, rtok_key = mapping[channel_key]
@@ -271,6 +304,11 @@ def filename_base(name: str) -> str:
     base = os.path.splitext(name or "")[0]
     return "-".join([s for s in base.replace("_","-").replace(" ","-").lower().split("-") if s])
 
+def normalize_location_for_wordpress(location: str) -> str:
+    """WP wants NA(Spanish) recorded as 'North America'."""
+    return "North America" if (location or "").strip().lower() == "north america (spanish)" else (location or "")
+
+
 # ---------------- WordPress worker (streaming, low RAM) ----------------
 def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post_id):
     """Download from Bunny and upload to WP Media. We DO NOT write local state; WP is the ledger."""
@@ -306,7 +344,7 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
             enc = MultipartEncoder(fields={
                 "file": (up_name, fh, mime),
                 "title": title or up_name,
-                "description": f"Uploaded by automation ({token})",  # <- searchable stamp
+                "description": f"Uploaded by automation ({token}) | location={normalize_location_for_wordpress(title or '')}"
             })
             mon = MultipartEncoderMonitor(enc, _progress)
             headers = {
@@ -427,6 +465,9 @@ def upload_wp():
     video_url = d.get("video_url")
     if not video_url:
         return jsonify({"error":"Missing video_url"}), 400
+
+    # NEW: optional incoming location from Monday.com; normalise for WP
+    wp_location = normalize_location_for_wordpress(d.get("location"))
 
     job_id = str(uuid.uuid4())
     threading.Thread(
