@@ -577,6 +577,40 @@ def upload_wp():
     ).start()
     return jsonify({"status":"processing","job_id":job_id}), 202
 
+@app.route("/upload-image-to-wordpress", methods=["POST"])
+def upload_wp_image():
+    """
+    Lightweight JSON API just for images/screenshots.
+
+    Expected JSON body:
+    {
+      "file_url": "<public HTTPS URL to the image>",
+      "filename": "EMO-2025-...-SS.png",
+      "title": "EMO 2025 - ... -SS",
+      "alt_text": "optional alt",
+      "post_id": 12345          # optional, attach to post
+    }
+    """
+    d = request.json or {}
+    file_url = d.get("file_url") or d.get("image_url") or d.get("video_url")
+    if not file_url:
+        return jsonify({"error": "Missing file_url / image_url"}), 400
+
+    job_id = str(uuid.uuid4())
+    threading.Thread(
+        target=async_upload_image_to_wordpress,
+        args=(
+            job_id,
+            file_url,
+            d.get("filename"),
+            d.get("title"),
+            d.get("alt_text"),
+            d.get("post_id"),
+        ),
+        daemon=True,
+    ).start()
+
+    return jsonify({"status": "processing", "job_id": job_id}), 202
 
 # ---------------- YouTube routes ----------------
 @app.route("/upload-to-youtube", methods=["POST"])
