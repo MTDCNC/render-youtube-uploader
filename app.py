@@ -396,6 +396,106 @@ def async_upload_to_wordpress(job_id, video_url, filename, title, alt_text, post
         except Exception:
             pass
 
+def async_upload_image_to_wordpress(job_id, file_url, filename, title, alt_text, post_id):
+    """
+    Dedicated image uploader that mimics Postman behaviour:
+    - downloads from a public URL (Monday S3, Bunny, etc.)
+    - uploads to WP via requests' native multipart (files=)
+    - stamps job:<job_id> in the description so /wp-status-by-job can find it
+    This does NOT touch the existing video uploader.
+    """
+    tmp = None
+    up_name = None
+    try:
+        up_name = filename or f"image_{job_id}.png"
+        tmp = f"wp_img_{job_id}"
+
+        app.logger.info(f"[WPIMG {job_id}] start file=\"{up_name}\"")
+        jlog("wpimg.start", job_id=job_id, filename=up_name, title=title)
+
+        # 1) download from source URL (streamed)
+        streamed_download(
+            file_url,
+            tmp,
+            f"[WPIMG {job_id}]",
+            on_progress=lambda p: jlog("wpimg.download.progress", job_id=job_id, filename=up_name, pct=p),
+        )
+
+        # 2) upload to WP using requests' native multipart (matches Postman)
+        token = f"job:{job_id}"
+        api = wp_api_base()
+        media_ep = f"{api}/media"
+        guess, _ = mimetypes.guess_type(up_name)
+        mime = guess or "image/png"  # safe default for screenshots
+
+        with open(tmp, "rb") as fh:
+            files = {
+                "file": (up_name, fh, mime),
+            }
+            data = {
+                "title": title or up_name,
+                "description": f"Uploaded by automation ({token})",
+            }
+
+            app.logger.info(f"[WPIMG {job_id}] POST {media_ep} (requests files=)")
+            t0 = time.time()
+            resp = requests.post(
+                media_ep,
+                files=files,
+                data=data,
+                auth=wp_auth(),
+                timeout=900,
+            )
+            app.logger.info(f"[WPIMG {job_id}] response {resp.status_code} in {time.time()-t0:.1f}s")
+
+        if resp.status_code == 201:
+            data = resp.json()
+            attach_id, src = data.get("id"), data.get("source_url")
+            app.logger.info(f"[WPIMG {job_id}] done id={attach_id} url={src}")
+            jlog("wpimg.done", job_id=job_id, attachment_id=attach_id, url=src)
+
+            # Optional: tiny metadata patch for alt_text / post_id
+            if any([alt_text, post_id]):
+                try:
+                    patch = {}
+                    if alt_text:
+                        patch["alt_text"] = alt_text
+                    if post_id:
+                        patch["post"] = int(post_id)
+                    requests.post(
+                        f"{api}/media/{attach_id}",
+                        json=patch,
+                        auth=wp_auth(),
+                        timeout=120,
+                    )
+                except Exception as e:
+                    app.logger.warning(f"[WPIMG {job_id}] meta patch failed: {e}")
+                    jlog("wpimg.meta.error", job_id=job_id, reason=str(e))
+
+        elif resp.status_code == 504:
+            # Proxy timeout — WP may still finish; /wp-status-by-job will pick it up
+            app.logger.warning(f"[WPIMG {job_id}] 504 proxy timeout (will rely on /wp-status-by-job)")
+            jlog("wpimg.timeout", job_id=job_id, reason="504 proxy timeout")
+
+        else:
+            try:
+                preview = json.dumps(resp.json())[:600]
+            except Exception:
+                preview = (resp.text or "")[:600]
+            app.logger.error(f"[WPIMG {job_id}] upload failed {resp.status_code}: {preview}")
+            jlog("wpimg.error", job_id=job_id, filename=up_name, status_code=resp.status_code, reason=preview)
+
+    except Exception as e:
+        app.logger.error(f"[WPIMG {job_id}] error: {e}")
+        jlog("wpimg.error", job_id=job_id, filename=up_name, reason=str(e))
+    finally:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
 # ---------------- Lookup: find WP media by Render job_id (searches Description stamp) ----------------
 @app.route('/wp-status-by-job', methods=['GET'])
 def wp_status_by_job():
