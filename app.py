@@ -567,7 +567,7 @@ def wp_status_by_job():
 @app.route("/process-linkedin-image", methods=["POST"])
 def process_linkedin_image_route():
     data = request.get_json(force=True) or {}
-    url = data.get("url")
+    url = data.get("image_url")
     filename = data.get("filename") or "linkedin_image"
 
     if not url:
