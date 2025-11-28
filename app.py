@@ -18,6 +18,9 @@ from google.auth.transport.requests import Request
 from zoneinfo import ZoneInfo  # Py3.9+
 import re
 
+#Import linkedIn image Processor functions
+from image_processor import process_linkedin_image
+
 # Flush logs immediately on Render
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -494,7 +497,10 @@ def async_upload_image_to_wordpress(job_id, file_url, filename, title, alt_text,
                 os.remove(tmp)
         except Exception:
             pass
-
+# ---------------- Cold start free render service for LinkedIn image processing ----------------
+@app.route("/health", methods=["GET"])
+def health_check():
+    return {"status": "ok"}, 200
 
 # ---------------- Lookup: find WP media by Render job_id (searches Description stamp) ----------------
 @app.route('/wp-status-by-job', methods=['GET'])
