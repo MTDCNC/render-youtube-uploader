@@ -1,6 +1,6 @@
 # app.py — minimal, low-memory uploader (YouTube + WordPress) with simple 504 verification + structured JSON logs.
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 import os, sys, json, uuid, threading, time, mimetypes, logging
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo  # Py3.9+
 import re
 
 #Import linkedIn image Processor functions
-from image_processor import process_linkedin_image
+from image_processor import process_linkedin_image as process_linkedin_image_helper
 
 # Flush logs immediately on Render
 try:
@@ -564,6 +564,30 @@ def wp_status_by_job():
     except Exception as e:
         return jsonify({'state': 'error', 'error': str(e)}), 500
 
+@app.route("/process-linkedin-image", methods=["POST"])
+def process_linkedin_image_route():
+    data = request.get_json(force=True) or {}
+    url = data.get("url")
+    filename = data.get("filename") or "linkedin_image"
+
+    if not url:
+        return jsonify({"success": False, "error": "Missing 'url'"}), 400
+
+    base_public_url = os.environ.get("PUBLIC_BASE_URL") or "https://render-youtube-uploader.onrender.com"
+
+    try:
+        result = process_linkedin_image_helper(
+            url=url,
+            filename=filename,
+            base_public_url=base_public_url,
+        )
+        return jsonify(result), 200
+
+    except Exception as e:
+        app.logger.exception("Error processing LinkedIn image")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 # ---------------- Routes (keep these) ----------------
 @app.route("/upload-to-wordpress", methods=["POST"])
 def upload_wp():
@@ -617,6 +641,13 @@ def upload_wp_image():
     ).start()
 
     return jsonify({"status": "processing", "job_id": job_id}), 202
+
+PROCESSED_DIR = os.environ.get("PROCESSED_IMAGES_DIR", "processed_images")
+
+@app.route("/images/<path:filename>", methods=["GET"])
+def serve_processed_image(filename):
+    return send_from_directory(PROCESSED_DIR, filename)
+
 
 # ---------------- YouTube routes ----------------
 @app.route("/upload-to-youtube", methods=["POST"])
