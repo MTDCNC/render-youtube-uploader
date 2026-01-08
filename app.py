@@ -21,6 +21,9 @@ import re
 #Import linkedIn image Processor functions
 from image_processor import process_linkedin_image as process_linkedin_image_helper
 
+#Import Product IMage Processor Functions
+from image_processor import process_product_image
+
 # Flush logs immediately on Render
 try:
     sys.stdout.reconfigure(line_buffering=True)
