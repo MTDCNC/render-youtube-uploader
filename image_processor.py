@@ -286,3 +286,161 @@ def process_linkedin_image(
         "download": download_meta,
         "timing": {"total_seconds": round(total_elapsed, 2)},
     }
+
+def process_product_image(
+    url: str,
+    filename: str,
+    *,
+    output_dir: str = PROCESSED_DIR,
+    base_public_url: Optional[str] = None,
+    max_width: int = 1000,
+    max_height: int = 1000,
+    max_filesize: int = DEFAULT_MAX_FILESIZE,
+) -> Dict[str, Any]:
+    """
+    Product image processor:
+    - Downloads image (any format incl. WEBP)
+    - Resizes for product display
+    - Outputs PNG preferred
+    - Falls back to JPEG if PNG exceeds max_filesize
+    - Saves to processed_images/
+    """
+
+    total_start = time.time()
+    ensure_output_dir(output_dir)
+
+    safe_name = sanitize_filename(filename)
+
+    logger.info("[process_product_image] Start url=%s filename=%s", url, safe_name)
+
+    # 1) Download image (reuse existing downloader logic)
+    resp = requests.get(
+        url,
+        timeout=15,
+        allow_redirects=True,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"Image download failed with status {resp.status_code}")
+
+    if not resp.headers.get("Content-Type", "").startswith("image/"):
+        raise RuntimeError("URL did not return an image")
+
+    original_bytes = resp.content
+
+    # 2) Open image
+    img = Image.open(io.BytesIO(original_bytes))
+    img.load()
+
+    orig_w, orig_h = img.size
+    logger.info(
+        "[process_product_image] Original size=%sx%s mode=%s format=%s",
+        orig_w,
+        orig_h,
+        img.mode,
+        img.format,
+    )
+
+    # 3) Calculate resize dimensions (simple fit within max_width/max_height)
+    target_size, _ = calculate_target_dimensions(
+        (orig_w, orig_h),
+        max_container_width=max_width,
+        max_container_height=max_height,
+        min_width=0,  # no forced upscale for products
+    )
+
+    img = img.resize(target_size, Image.LANCZOS)
+
+    # 4) Attempt PNG first
+    png_bytes = None
+    png_size = 0
+
+    try:
+        png_buf = io.BytesIO()
+        if img.mode not in ("RGBA", "LA"):
+            img_png = img.convert("RGBA")
+        else:
+            img_png = img
+
+        img_png.save(png_buf, format="PNG", optimize=True, compress_level=6)
+        png_bytes = png_buf.getvalue()
+        png_size = len(png_bytes)
+
+        logger.info("[process_product_image] PNG attempt size=%s bytes", png_size)
+
+    except Exception as e:
+        logger.warning("[process_product_image] PNG conversion failed: %s", e)
+
+    # 5) Decide final format
+    if png_bytes and png_size <= max_filesize:
+        final_bytes = png_bytes
+        output_format = "PNG"
+        ext = ".png"
+
+    else:
+        # Fallback to JPEG
+        logger.info("[process_product_image] Falling back to JPEG")
+
+        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img.convert("RGBA"), mask=img.convert("RGBA").split()[-1])
+            img_jpg = bg
+        else:
+            img_jpg = img.convert("RGB")
+
+        qualities = [85, 80, 75, 70, 65, 60, 55]
+        final_bytes = None
+
+        for q in qualities:
+            buf = io.BytesIO()
+            img_jpg.save(buf, format="JPEG", quality=q, optimize=True)
+            data = buf.getvalue()
+
+            logger.info(
+                "[process_product_image] JPEG quality=%s size=%s bytes",
+                q,
+                len(data),
+            )
+
+            final_bytes = data
+            if len(data) <= max_filesize:
+                break
+
+        output_format = "JPEG"
+        ext = ".jpg"
+
+    # 6) Save to disk
+    final_filename = safe_name + ext
+    local_path = os.path.join(output_dir, final_filename)
+
+    with open(local_path, "wb") as f:
+        f.write(final_bytes)
+
+    # 7) Build public URL
+    processed_url = None
+    if base_public_url:
+        processed_url = f"{base_public_url.rstrip('/')}/images/{final_filename}"
+
+    elapsed = round(time.time() - total_start, 2)
+
+    logger.info(
+        "[process_product_image] SUCCESS filename=%s format=%s size=%s bytes time=%.2fs",
+        final_filename,
+        output_format,
+        len(final_bytes),
+        elapsed,
+    )
+
+    return {
+        "success": True,
+        "filename": final_filename,
+        "output_format": output_format,
+        "local_path": local_path,
+        "processed_url": processed_url,
+        "original_size": [orig_w, orig_h],
+        "processed_size": list(img.size),
+        "file_size": len(final_bytes),
+        "timing": {"total_seconds": elapsed},
+    }
+
