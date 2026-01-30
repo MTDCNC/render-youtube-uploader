@@ -22,7 +22,7 @@ import re
 from image_processor import process_linkedin_image as process_linkedin_image_helper
 
 #Import Product IMage Processor Functions
-from image_processor import process_product_image
+from image_processor import process_product_image as process_product_image_helper
 
 # Flush logs immediately on Render
 try:
@@ -588,6 +588,29 @@ def process_linkedin_image_route():
 
     except Exception as e:
         app.logger.exception("Error processing LinkedIn image")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/process-product-image", methods=["POST"])
+def process_product_image_route():
+    data = request.get_json(force=True) or {}
+    url = data.get("image_url")
+    filename = data.get("filename") or "product_image"
+
+    if not url:
+        return jsonify({"success": False, "error": "Missing 'image_url'"}), 400
+
+    base_public_url = os.environ.get("PUBLIC_BASE_URL") or "https://render-youtube-uploader.onrender.com"
+
+    try:
+        result = process_product_image_helper(
+            url=url,
+            filename=filename,
+            base_public_url=base_public_url,
+        )
+        return jsonify(result), 200
+
+    except Exception as e:
+        app.logger.exception("Error processing product image")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
