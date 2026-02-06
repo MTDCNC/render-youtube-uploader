@@ -5,8 +5,10 @@ from flask import Flask, jsonify, request
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from flask import Blueprint
 
-app = Flask(__name__)
+etg_bp = Blueprint("etg", __name__)
+
 
 ETG_ENDPOINT = "https://engtechgroup.com/wp-content/themes/ETG/machines/filter-machines.php"
 
