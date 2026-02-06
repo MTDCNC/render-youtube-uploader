@@ -11,6 +11,11 @@ from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 
 app = Flask(__name__)
 
+@app.route("/_routes", methods=["GET"])
+def list_routes():
+    return jsonify(sorted([str(r) for r in app.url_map.iter_rules()])), 200
+
+
 # ---- ETG Product Scraper
 from etg_routes import etg_bp
 app.register_blueprint(etg_bp, url_prefix="/etg")
