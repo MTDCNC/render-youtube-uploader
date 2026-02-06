@@ -42,7 +42,6 @@ try:
 except Exception:
     pass
 
-app = Flask(__name__)
 
 # ---------------- tiny utils ----------------
 def iso_now():
