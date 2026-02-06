@@ -46,7 +46,7 @@ def build_session() -> requests.Session:
     })
     return s
 
-@app.route("/etg/products", methods=["GET"])
+@etg_bp.route("/etg/products", methods=["GET"])
 def etg_products():
     # raise defaults so you can prove full 310 first
     max_seconds = int(request.args.get("max_seconds", "120"))
