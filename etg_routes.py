@@ -1,11 +1,11 @@
+# etg_routes.py
 import time
 import hashlib
 from datetime import datetime
-from flask import Flask, jsonify, request
+from flask import jsonify, request, Blueprint
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from flask import Blueprint
 
 etg_bp = Blueprint("etg", __name__)
 
