@@ -9,6 +9,11 @@ import requests
 from requests.auth import HTTPBasicAuth
 from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 
+# ---- ETG Product Scraper
+from etg_routes import etg_bp
+app.register_blueprint(etg_bp, url_prefix="/etg")
+
+
 # ---- YouTube deps ----
 from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
