@@ -1,16 +1,94 @@
 # etg_routes.py
-import time
+import time, os, mimetypes
 import hashlib
 from datetime import datetime
 from flask import jsonify, request, Blueprint
 import requests
 from requests.adapters import HTTPAdapter
+from requests.auth imprt HTTPBasicAuth
 from urllib3.util.retry import Retry
 
 etg_bp = Blueprint("etg", __name__)
 
 
 ETG_ENDPOINT = "https://engtechgroup.com/wp-content/themes/ETG/machines/filter-machines.php"
+
+def wp_auth():
+    return HTTPBasicAuth(WP_USER, WP_APP_PASSWORD)
+
+def strip_query(u: str) -> str:
+    return u.split("?", 1)[0]
+
+def filename_from_url(u: str) -> str:
+    u = strip_query(u)
+    return u.rsplit("/", 1)[-1] or f"image_{int(time.time())}.png"
+
+def wp_upload_image(image_url: str, title: str = "", alt_text: str = "") -> tuple[int | None, str | None]:
+    url = strip_query(image_url)
+
+    r = requests.get(url, stream=True, timeout=60)
+    r.raise_for_status()
+
+    filename = filename_from_url(url)
+    mime = mimetypes.guess_type(filename)[0] or "image/png"
+
+    files = {"file": (filename, r.raw, mime)}
+    data = {"title": title or filename, "alt_text": alt_text or ""}
+
+    resp = requests.post(f"{WP_API_BASE}/media", files=files, data=data, auth=wp_auth(), timeout=180)
+    if resp.status_code != 201:
+        raise RuntimeError(f"WP media upload failed {resp.status_code}: {(resp.text or '')[:300]}")
+    j = resp.json()
+    return j.get("id"), j.get("source_url")
+
+@etg_bp.route("/upload-product-images", methods=["POST"])
+def upload_product_images():
+    d = request.get_json(force=True) or {}
+    image_urls = d.get("image_urls") or []
+    featured_url = d.get("featured_url")
+    title_prefix = (d.get("title_prefix") or "").strip()
+    alt_text = (d.get("alt_text") or "").strip()
+
+    # basic hygiene: strip queries + drop _thumb + de-dupe while preserving order
+    seen = set()
+    cleaned = []
+    for u in image_urls:
+        if not u: 
+            continue
+        u0 = strip_query(u)
+        if "_thumb" in u0:
+            continue
+        if u0 in seen:
+            continue
+        seen.add(u0)
+        cleaned.append(u0)
+
+    if not cleaned:
+        return jsonify({"error": "No valid image_urls"}), 400
+
+    gallery_ids = []
+    failed = []
+
+    featured_id = None
+    featured_url0 = strip_query(featured_url) if featured_url else None
+
+    for idx, u in enumerate(cleaned, start=1):
+        try:
+            title = f"{title_prefix} ({idx})" if title_prefix else filename_from_url(u)
+            att_id, _src = wp_upload_image(u, title=title, alt_text=alt_text)
+            if att_id:
+                gallery_ids.append(att_id)
+                if featured_url0 and u == featured_url0:
+                    featured_id = att_id
+        except Exception as e:
+            failed.append({"url": u, "error": str(e)})
+
+    return jsonify({
+        "uploaded": len(gallery_ids),
+        "failed": failed,
+        "gallery_ids": gallery_ids,
+        "featured_id": featured_id
+    }), 200
 
 def slugify(text: str) -> str:
     t = (text or "").strip().lower().replace("&", "and")
