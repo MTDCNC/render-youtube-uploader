@@ -75,7 +75,9 @@ def upload_product_images():
     for idx, u in enumerate(cleaned, start=1):
         try:
             title = f"{title_prefix} ({idx})" if title_prefix else filename_from_url(u)
-            att_id, _src = wp_upload_image(u, title=title, alt_text=alt_text)
+            alt = f"{alt_text} ({idx})" if alt_text else None
+            
+            att_id, _src = wp_upload_image(u, title=title, alt_text=alt)
             if att_id:
                 gallery_ids.append(att_id)
                 if featured_url0 and u == featured_url0:
