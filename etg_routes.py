@@ -5,7 +5,7 @@ from datetime import datetime
 from flask import jsonify, request, Blueprint
 import requests
 from requests.adapters import HTTPAdapter
-from requests.auth imprt HTTPBasicAuth
+from requests.auth import HTTPBasicAuth
 from urllib3.util.retry import Retry
 
 etg_bp = Blueprint("etg", __name__)
