@@ -10,6 +10,10 @@ from urllib3.util.retry import Retry
 
 etg_bp = Blueprint("etg", __name__)
 
+WP_API_BASE = os.environ.get("WP_API_BASE", "").rstrip("/")
+WP_USER = os.environ.get("WP_USER", "")
+WP_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
+
 
 ETG_ENDPOINT = "https://engtechgroup.com/wp-content/themes/ETG/machines/filter-machines.php"
 
