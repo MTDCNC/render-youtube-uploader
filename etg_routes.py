@@ -7,6 +7,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
 from urllib3.util.retry import Retry
+from PIL import Image
+from io import BytesIO
 
 etg_bp = Blueprint("etg", __name__)
 
@@ -27,16 +29,69 @@ def filename_from_url(u: str) -> str:
     u = strip_query(u)
     return u.rsplit("/", 1)[-1] or f"image_{int(time.time())}.png"
 
-def wp_upload_image(image_url: str, title: str = "", alt_text: str = "") -> tuple[int | None, str | None]:
+def resize_to_16_9(image_url: str, max_width: int = 1000) -> BytesIO:
+    """
+    Download image, force to 16:9 aspect ratio by adding padding, 
+    and scale to max width.
+    """
+    # Download image
     url = strip_query(image_url)
-
     r = requests.get(url, stream=True, timeout=60)
     r.raise_for_status()
+    
+    # Open with Pillow
+    img = Image.open(r.raw)
+    
+    # Convert to RGB if needed (handles RGBA, P, etc)
+    if img.mode not in ('RGB', 'L'):
+        img = img.convert('RGB')
+    
+    orig_width, orig_height = img.size
+    orig_aspect = orig_width / orig_height
+    target_aspect = 16 / 9
+    
+    # Calculate new dimensions to achieve 16:9
+    if orig_aspect < target_aspect:
+        # Image is too tall/square - add width padding
+        new_width = int(orig_height * target_aspect)
+        new_height = orig_height
+    else:
+        # Image is too wide - add height padding
+        new_width = orig_width
+        new_height = int(orig_width / target_aspect)
+    
+    # Create new canvas with white background
+    new_img = Image.new('RGB', (new_width, new_height), (255, 255, 255))
+    
+    # Center original image on canvas
+    paste_x = (new_width - orig_width) // 2
+    paste_y = (new_height - orig_height) // 2
+    new_img.paste(img, (paste_x, paste_y))
+    
+    # Scale down to max width if needed
+    if new_width > max_width:
+        scale_factor = max_width / new_width
+        final_width = max_width
+        final_height = int(new_height * scale_factor)
+        new_img = new_img.resize((final_width, final_height), Image.LANCZOS)
+    
+    # Save to BytesIO as JPEG
+    output = BytesIO()
+    new_img.save(output, format='JPEG', quality=90)
+    output.seek(0)
+    
+    return output
 
-    filename = filename_from_url(url)
-    mime = mimetypes.guess_type(filename)[0] or "image/png"
-
-    files = {"file": (filename, r.raw, mime)}
+def wp_upload_image(image_url: str, title: str = "", alt_text: str = "") -> tuple[int | None, str | None]:
+    # Process image to 16:9 aspect ratio
+    processed_img = resize_to_16_9(image_url)
+    
+    filename = filename_from_url(image_url)
+    # Force .jpg extension since we're converting to JPEG
+    if not filename.lower().endswith(('.jpg', '.jpeg')):
+        filename = filename.rsplit('.', 1)[0] + '.jpg'
+    
+    files = {"file": (filename, processed_img, "image/jpeg")}
     data = {"title": title or filename, "alt_text": alt_text or ""}
 
     resp = requests.post(f"{WP_API_BASE}/media", files=files, data=data, auth=wp_auth(), timeout=180)
