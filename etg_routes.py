@@ -29,19 +29,11 @@ def filename_from_url(u: str) -> str:
     u = strip_query(u)
     return u.rsplit("/", 1)[-1] or f"image_{int(time.time())}.png"
 
-def resize_to_16_9(image_url: str, max_width: int = 1000) -> BytesIO:
+def resize_to_16_9(img: Image.Image, max_width: int = 1000) -> BytesIO:
     """
-    Download image, force to 16:9 aspect ratio by adding padding, 
-    and scale to max width.
+    Force image to 16:9 aspect ratio by adding padding, and scale to max width.
+    Takes a PIL Image object instead of URL.
     """
-    # Download image
-    url = strip_query(image_url)
-    r = requests.get(url, stream=True, timeout=60)
-    r.raise_for_status()
-    
-    # Open with Pillow
-    img = Image.open(r.raw)
-    
     # Convert to RGB if needed (handles RGBA, P, etc)
     if img.mode not in ('RGB', 'L'):
         img = img.convert('RGB')
@@ -82,11 +74,24 @@ def resize_to_16_9(image_url: str, max_width: int = 1000) -> BytesIO:
     
     return output
 
-def wp_upload_image(image_url: str, title: str = "", alt_text: str = "") -> tuple[int | None, str | None]:
-    # Process image to 16:9 aspect ratio
-    processed_img = resize_to_16_9(image_url)
+def wp_upload_image(image_url: str, title: str = "", alt_text: str = "") -> tuple[int | None, str | None, int | None]:
+    """
+    Download, resize, and upload image. Returns (attachment_id, source_url, original_width).
+    """
+    url = strip_query(image_url)
     
-    filename = filename_from_url(image_url)
+    # Download once
+    r = requests.get(url, stream=True, timeout=60)
+    r.raise_for_status()
+    
+    # Open with Pillow
+    img = Image.open(r.raw)
+    orig_width = img.size[0]
+    
+    # Process to 16:9
+    processed_img = resize_to_16_9(img)
+    
+    filename = filename_from_url(url)
     # Force .jpg extension since we're converting to JPEG
     if not filename.lower().endswith(('.jpg', '.jpeg')):
         filename = filename.rsplit('.', 1)[0] + '.jpg'
@@ -98,7 +103,8 @@ def wp_upload_image(image_url: str, title: str = "", alt_text: str = "") -> tupl
     if resp.status_code != 201:
         raise RuntimeError(f"WP media upload failed {resp.status_code}: {(resp.text or '')[:300]}")
     j = resp.json()
-    return j.get("id"), j.get("source_url")
+    return j.get("id"), j.get("source_url"), orig_width
+
 
 @etg_bp.route("/upload-product-images", methods=["POST"])
 def upload_product_images():
@@ -134,10 +140,9 @@ def upload_product_images():
             title = f"{title_prefix} ({idx})" if title_prefix else filename_from_url(u)
             alt = f"{alt_text} ({idx})" if alt_text else None
             
-            # Get image dimensions before uploading
-            img_width = get_image_width(u)
+            # Upload returns original width
+            att_id, _src, img_width = wp_upload_image(u, title=title, alt_text=alt)
             
-            att_id, _src = wp_upload_image(u, title=title, alt_text=alt)
             if att_id:
                 gallery_ids.append(att_id)
                 
@@ -156,6 +161,7 @@ def upload_product_images():
         "featured_id": featured_id,
         "featured_width": largest_width if largest_width > 0 else None
     }), 200
+
 
 def get_image_width(image_url: str) -> int | None:
     """Download image and return its width in pixels."""
