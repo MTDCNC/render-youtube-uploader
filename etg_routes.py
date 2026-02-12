@@ -34,8 +34,20 @@ def resize_to_16_9(img: Image.Image, max_width: int = 1000) -> BytesIO:
     Force image to 16:9 aspect ratio by adding padding, and scale to max width.
     Takes a PIL Image object instead of URL.
     """
-    # Convert to RGB if needed (handles RGBA, P, etc)
-    if img.mode not in ('RGB', 'L'):
+    # Handle transparency: composite onto white background first
+    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+        # Create white background
+        background = Image.new('RGB', img.size, (255, 255, 255))
+        if img.mode == 'P':
+            img = img.convert('RGBA')
+        # Composite image onto white background
+        background.paste(img, mask=img.split()[-1])  # Use alpha channel as mask
+        img = background
+    elif img.mode not in ('RGB', 'L'):
+        img = img.convert('RGB')
+    
+    # Ensure RGB mode
+    if img.mode != 'RGB':
         img = img.convert('RGB')
     
     orig_width, orig_height = img.size
