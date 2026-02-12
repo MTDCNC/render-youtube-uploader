@@ -104,7 +104,6 @@ def wp_upload_image(image_url: str, title: str = "", alt_text: str = "") -> tupl
 def upload_product_images():
     d = request.get_json(force=True) or {}
     image_urls = d.get("image_urls") or []
-    featured_url = d.get("featured_url")
     title_prefix = (d.get("title_prefix") or "").strip()
     alt_text = (d.get("alt_text") or "").strip()
 
@@ -127,20 +126,26 @@ def upload_product_images():
 
     gallery_ids = []
     failed = []
-
+    largest_width = 0
     featured_id = None
-    featured_url0 = strip_query(featured_url) if featured_url else None
 
     for idx, u in enumerate(cleaned, start=1):
         try:
             title = f"{title_prefix} ({idx})" if title_prefix else filename_from_url(u)
             alt = f"{alt_text} ({idx})" if alt_text else None
             
+            # Get image dimensions before uploading
+            img_width = get_image_width(u)
+            
             att_id, _src = wp_upload_image(u, title=title, alt_text=alt)
             if att_id:
                 gallery_ids.append(att_id)
-                if featured_url0 and u == featured_url0:
+                
+                # Track largest width image for featured
+                if img_width and img_width > largest_width:
+                    largest_width = img_width
                     featured_id = att_id
+                    
         except Exception as e:
             failed.append({"url": u, "error": str(e)})
 
@@ -148,8 +153,20 @@ def upload_product_images():
         "uploaded": len(gallery_ids),
         "failed": failed,
         "gallery_ids": gallery_ids,
-        "featured_id": featured_id
+        "featured_id": featured_id,
+        "featured_width": largest_width if largest_width > 0 else None
     }), 200
+
+def get_image_width(image_url: str) -> int | None:
+    """Download image and return its width in pixels."""
+    try:
+        url = strip_query(image_url)
+        r = requests.get(url, stream=True, timeout=30)
+        r.raise_for_status()
+        img = Image.open(r.raw)
+        return img.size[0]  # width
+    except Exception:
+        return None
 
 def slugify(text: str) -> str:
     t = (text or "").strip().lower().replace("&", "and")
