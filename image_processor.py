@@ -528,6 +528,8 @@ def process_linkedin_images_batch(
     *,
     base_public_url: Optional[str] = None,
     upload_to_wordpress: bool = True,
+    user_id: str = "",
+    title: str = "",
 ) -> Dict[str, Any]:
     """
     Conform multiple LinkedIn images and (optionally) sideload each into the
@@ -553,14 +555,18 @@ def process_linkedin_images_batch(
         urls = [u.strip() for u in urls.split(",") if u.strip()]
     urls = [str(u).strip() for u in (urls or []) if str(u).strip()]
 
+     # Build a base filename stem: <user_id>_<title[:15]>, sanitised.
+    title_part = sanitize_filename((title or "").strip())[:15].strip("_")
+    user_part = sanitize_filename((user_id or "").strip())
+    stem = "_".join(p for p in (user_part, title_part) if p) or "linkedin_image"
+
     results = []
-    for raw_url in urls:
+    for idx, raw_url in enumerate(urls, start=1):
         entry: Dict[str, Any] = {"sourceUrl": raw_url, "ok": False}
         try:
-            # Unique filename per image so disk + WP never collide within a post.
             out = process_linkedin_image(
-                raw_url,                      # URL passed through UNTOUCHED
-                uuid.uuid4().hex,
+                raw_url,
+                f"{stem}_{idx}",          # e.g. bott-ltd_RoyalCornwall_1
                 base_public_url=base_public_url,
             )
             entry["cleanUrl"] = out["processed_url"]
