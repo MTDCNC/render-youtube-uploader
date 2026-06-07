@@ -33,6 +33,18 @@ import re
 #Import linkedIn image Processor functions
 from image_processor import process_linkedin_image as process_linkedin_image_helper
 
+#Iport LinkedIn image Batch Processor for multiple images.
+from image_processor import process_linkedin_images_batch
+
+@app.route("/process-linkedin-images", methods=["POST"])
+def process_linkedin_images_batch_route():
+    body = request.get_json(force=True, silent=True) or {}
+    urls = body.get("imageUrls") or body.get("urls") or []
+    if not urls:
+        return jsonify({"ok": False, "error": "No image URLs supplied"}), 400
+    result = process_linkedin_images_batch(urls, base_public_url=BASE_PUBLIC_URL)
+    return jsonify(result), 200
+
 #Import Product IMage Processor Functions
 from image_processor import process_product_image as process_product_image_helper
 
