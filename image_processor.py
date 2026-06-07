@@ -1,6 +1,7 @@
 import io
 import os
 import time
+import uuid
 import logging
 from typing import Tuple, Dict, Any, Optional
 
@@ -444,3 +445,152 @@ def process_product_image(
         "timing": {"total_seconds": elapsed},
     }
 
+
+# ---------- WordPress sideload ----------
+
+def _wp_credentials() -> Tuple[str, Tuple[str, str]]:
+    """
+    Read WordPress media credentials from the environment.
+    Raises a clear error if any are missing so the batch fails loudly
+    rather than silently producing posts with no images.
+
+    Required env vars:
+      WP_MEDIA_ENDPOINT  e.g. https://mtdcnc.com/wp-json/wp/v2/media
+      WP_USER            WordPress username
+      WP_APP_PASSWORD    WordPress application password
+    """
+    endpoint = os.environ.get("WP_MEDIA_ENDPOINT")
+    user = os.environ.get("WP_USER")
+    app_password = os.environ.get("WP_APP_PASSWORD")
+
+    missing = [
+        name for name, val in (
+            ("WP_MEDIA_ENDPOINT", endpoint),
+            ("WP_USER", user),
+            ("WP_APP_PASSWORD", app_password),
+        ) if not val
+    ]
+    if missing:
+        raise RuntimeError(f"Missing WordPress env vars: {', '.join(missing)}")
+
+    return endpoint, (user, app_password)
+
+
+def sideload_image_to_wordpress(local_path: str, filename: str, timeout: int = 60) -> int:
+    """
+    Upload a processed image file from disk into the WordPress media library.
+    Mirrors the existing Zapier 'Post image to Wordpress' step:
+      POST {WP_MEDIA_ENDPOINT}
+      Basic Auth, Content-Disposition: attachment; filename="..."
+    Returns the new attachment's media ID.
+    """
+    endpoint, auth = _wp_credentials()
+
+    with open(local_path, "rb") as f:
+        file_bytes = f.read()
+
+    logger.info(
+        "[sideload_image_to_wordpress] Uploading %s (%s bytes) -> %s",
+        filename, len(file_bytes), endpoint,
+    )
+
+    resp = requests.post(
+        endpoint,
+        auth=auth,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": "image/jpeg",  # process_linkedin_image always outputs JPEG
+        },
+        data=file_bytes,
+        timeout=timeout,
+    )
+
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(
+            f"WordPress media upload failed: HTTP {resp.status_code} {resp.text[:300]}"
+        )
+
+    media_id = resp.json().get("id")
+    if not media_id:
+        raise RuntimeError(f"WordPress media upload returned no id: {resp.text[:300]}")
+
+    logger.info(
+        "[sideload_image_to_wordpress] SUCCESS media_id=%s filename=%s",
+        media_id, filename,
+    )
+    return media_id
+
+
+# ---------- Batch: conform N images + (optionally) sideload to WordPress ----------
+
+def process_linkedin_images_batch(
+    urls,
+    *,
+    base_public_url: Optional[str] = None,
+    upload_to_wordpress: bool = True,
+) -> Dict[str, Any]:
+    """
+    Conform multiple LinkedIn images and (optionally) sideload each into the
+    WordPress media library, ready for the ACF gallery write.
+
+    `urls` may be a list of URLs OR a single comma-joined string
+    (LinkedIn signed URLs contain no commas, so splitting on ',' is safe).
+    URLs are passed through to requests.get() byte-for-byte — never edited.
+
+    Returns:
+      {
+        "ok": bool,                 # at least one image succeeded
+        "processed": int,
+        "failed": int,
+        "featuredMediaId": int|None,# first successful media ID  -> WP featured_media
+        "galleryIds": [int, ...],   # remaining media IDs        -> acf.gallery
+        "allMediaIds": [int, ...],  # all successful media IDs (incl. featured)
+        "cleanUrls": [str, ...],    # conformed Render URLs (audit / fallback)
+        "results": [ {per-item detail incl. failures} ]
+      }
+    """
+    if isinstance(urls, str):
+        urls = [u.strip() for u in urls.split(",") if u.strip()]
+    urls = [str(u).strip() for u in (urls or []) if str(u).strip()]
+
+    results = []
+    for raw_url in urls:
+        entry: Dict[str, Any] = {"sourceUrl": raw_url, "ok": False}
+        try:
+            # Unique filename per image so disk + WP never collide within a post.
+            out = process_linkedin_image(
+                raw_url,                      # URL passed through UNTOUCHED
+                uuid.uuid4().hex,
+                base_public_url=base_public_url,
+            )
+            entry["cleanUrl"] = out["processed_url"]
+            entry["filename"] = out["filename"]
+            entry["processed_size"] = out["processed_size"]
+            entry["file_size"] = out["file_size"]
+
+            if upload_to_wordpress:
+                entry["mediaId"] = sideload_image_to_wordpress(
+                    out["local_path"], out["filename"]
+                )
+
+            entry["ok"] = True
+        except Exception as e:
+            logger.exception("[process_linkedin_images_batch] Failed url=%s", raw_url)
+            entry["error"] = str(e)
+
+        results.append(entry)
+
+    succeeded = [r for r in results if r["ok"]]
+    media_ids = [r["mediaId"] for r in succeeded if r.get("mediaId")]
+    clean_urls = [r["cleanUrl"] for r in succeeded if r.get("cleanUrl")]
+
+    return {
+        "ok": len(succeeded) > 0,
+        "processed": len(succeeded),
+        "failed": len(results) - len(succeeded),
+        "featuredMediaId": media_ids[0] if media_ids else None,
+        "galleryIds": media_ids[1:],
+        "allMediaIds": media_ids,
+        "cleanUrls": clean_urls,
+        "results": results,
+    }
