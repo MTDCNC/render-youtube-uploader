@@ -3,6 +3,8 @@ import os
 import time
 import uuid
 import logging
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Tuple, Dict, Any, Optional
 
 import requests
@@ -17,6 +19,11 @@ DEFAULT_MAX_CONTAINER_HEIGHT = int(os.environ.get("IMG_MAX_CONTAINER_HEIGHT", 72
 DEFAULT_MIN_WIDTH = int(os.environ.get("IMG_MIN_WIDTH", 640))
 PROCESSED_DIR = os.environ.get("PROCESSED_IMAGES_DIR", "processed_images")
 
+# Batch sideload tuning (see process_linkedin_images_batch)
+SIDELOAD_CONCURRENCY = int(os.environ.get("WP_SIDELOAD_CONCURRENCY", 4))
+MAX_IMAGES_PER_POST = int(os.environ.get("MAX_IMAGES_PER_POST", 10))
+SIDELOAD_RETRIES = int(os.environ.get("WP_SIDELOAD_RETRIES", 2))
+
 
 # ---------- Helpers ----------
 
@@ -27,8 +34,15 @@ def ensure_output_dir(path: str = PROCESSED_DIR) -> str:
 
 
 def sanitize_filename(raw: str) -> str:
-    """Basic filename sanitizer: spaces → _, strip weird characters."""
-    # You can tighten this if you like
+    """Filename sanitizer that is latin-1 safe.
+
+    HTTP headers (Content-Disposition) are encoded as latin-1, and Python's
+    str.isalnum() returns True for non-ASCII letters (e.g. the Czech 'ř'), so
+    the old sanitizer let them through and the WordPress upload crashed with
+    UnicodeEncodeError. Normalising to ASCII first fixes that for every caller
+    (LinkedIn images AND product images).
+    """
+    raw = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
     safe = "".join(c for c in raw if c.isalnum() or c in ("-", "_", ".", " "))
     return safe.replace(" ", "_")
 
@@ -483,6 +497,12 @@ def sideload_image_to_wordpress(local_path: str, filename: str, timeout: int = 6
       POST {WP_MEDIA_ENDPOINT}
       Basic Auth, Content-Disposition: attachment; filename="..."
     Returns the new attachment's media ID.
+
+    NOTE: this is NOT idempotent. WordPress does not dedupe on filename - a
+    colliding filename gets '-1', '-2' appended and a NEW attachment is created.
+    So a retried call re-uploads as fresh media. The batch design avoids retries
+    by never timing out; true idempotency (skip if already uploaded) is a
+    separate hardening if you ever need it.
     """
     endpoint, auth = _wp_credentials()
 
@@ -521,7 +541,51 @@ def sideload_image_to_wordpress(local_path: str, filename: str, timeout: int = 6
     return media_id
 
 
+def _sideload_with_retry(local_path: str, filename: str) -> int:
+    """Wrap the existing sideload with bounded retry + backoff for transient
+    WP 5xx / connection resets under concurrent load."""
+    last_err = None
+    for attempt in range(SIDELOAD_RETRIES + 1):
+        try:
+            return sideload_image_to_wordpress(local_path, filename)
+        except Exception as e:
+            last_err = e
+            if attempt < SIDELOAD_RETRIES:
+                time.sleep(1.5 * (attempt + 1))  # 1.5s, then 3s
+    raise last_err
+
+
 # ---------- Batch: conform N images + (optionally) sideload to WordPress ----------
+
+def _conform_and_sideload(index, raw_url, stem, base_public_url, upload_to_wordpress):
+    """One image, end to end. Runs inside a worker thread.
+
+    process_linkedin_image is thread-safe here: each call uses a unique filename
+    (stem_<index>) and its own PIL/requests objects, so there is no shared
+    mutable state between workers.
+    """
+    entry: Dict[str, Any] = {"sourceUrl": raw_url, "ok": False}
+    try:
+        out = process_linkedin_image(
+            raw_url,                       # URL passed through UNTOUCHED (signed/expiring)
+            f"{stem}_{index}",             # e.g. bott-ltd_RoyalCornwall_1
+            base_public_url=base_public_url,
+        )
+        entry["cleanUrl"] = out["processed_url"]
+        entry["filename"] = out["filename"]
+        entry["processed_size"] = out["processed_size"]
+        entry["file_size"] = out["file_size"]
+
+        if upload_to_wordpress:
+            entry["mediaId"] = _sideload_with_retry(out["local_path"], out["filename"])
+
+        entry["ok"] = True
+    except Exception as e:
+        logger.exception("[process_linkedin_images_batch] Failed url=%s", raw_url)
+        entry["error"] = str(e)
+
+    return index, entry
+
 
 def process_linkedin_images_batch(
     urls,
@@ -539,14 +603,20 @@ def process_linkedin_images_batch(
     (LinkedIn signed URLs contain no commas, so splitting on ',' is safe).
     URLs are passed through to requests.get() byte-for-byte — never edited.
 
+    Concurrency: WP sideload is ~8.6s of idle network wait per image, so the
+    sideloads run in a thread pool (WP_SIDELOAD_CONCURRENCY, default 4). A
+    10-image post finishes in ~26s instead of ~86s, keeping every call well
+    under any caller timeout. A per-post cap (MAX_IMAGES_PER_POST, default 10)
+    is the backstop so even a 20-image carousel cannot approach the limit.
+
     Returns:
       {
         "ok": bool,                 # at least one image succeeded
         "processed": int,
         "failed": int,
         "featuredMediaId": int|None,# first successful media ID  -> WP featured_media
-        "galleryIds": [int, ...],   # remaining media IDs        -> acf.gallery
-        "allMediaIds": [int, ...],  # all successful media IDs (incl. featured)
+        "galleryIds": [int, ...],   # ALL media IDs incl. featured -> acf.gallery
+        "allMediaIds": [int, ...],  # same list (kept for back-compat)
         "cleanUrls": [str, ...],    # conformed Render URLs (audit / fallback)
         "results": [ {per-item detail incl. failures} ]
       }
@@ -555,37 +625,35 @@ def process_linkedin_images_batch(
         urls = [u.strip() for u in urls.split(",") if u.strip()]
     urls = [str(u).strip() for u in (urls or []) if str(u).strip()]
 
-     # Build a base filename stem: <user_id>_<title[:15]>, sanitised.
+    # Backstop cap. Featured is index 0, so the cap keeps the most important ones.
+    if len(urls) > MAX_IMAGES_PER_POST:
+        logger.info(
+            "[process_linkedin_images_batch] capping %s urls to %s",
+            len(urls), MAX_IMAGES_PER_POST,
+        )
+        urls = urls[:MAX_IMAGES_PER_POST]
+
+    # Build a base filename stem: <user_id>_<title[:15]>, ASCII/latin-1 safe.
     title_part = sanitize_filename((title or "").strip())[:15].strip("_")
     user_part = sanitize_filename((user_id or "").strip())
     stem = "_".join(p for p in (user_part, title_part) if p) or "linkedin_image"
 
-    results = []
-    for idx, raw_url in enumerate(urls, start=1):
-        entry: Dict[str, Any] = {"sourceUrl": raw_url, "ok": False}
-        try:
-            out = process_linkedin_image(
-                raw_url,
-                f"{stem}_{idx}",          # e.g. bott-ltd_RoyalCornwall_1
-                base_public_url=base_public_url,
+    # Conform + sideload each image concurrently, then reassemble in input order
+    # so featuredMediaId is always the FIRST input image.
+    ordered = [None] * len(urls)
+    with ThreadPoolExecutor(max_workers=SIDELOAD_CONCURRENCY) as pool:
+        futures = [
+            pool.submit(
+                _conform_and_sideload, idx, raw_url, stem,
+                base_public_url, upload_to_wordpress,
             )
-            entry["cleanUrl"] = out["processed_url"]
-            entry["filename"] = out["filename"]
-            entry["processed_size"] = out["processed_size"]
-            entry["file_size"] = out["file_size"]
+            for idx, raw_url in enumerate(urls, start=1)
+        ]
+        for fut in as_completed(futures):
+            idx, entry = fut.result()
+            ordered[idx - 1] = entry
 
-            if upload_to_wordpress:
-                entry["mediaId"] = sideload_image_to_wordpress(
-                    out["local_path"], out["filename"]
-                )
-
-            entry["ok"] = True
-        except Exception as e:
-            logger.exception("[process_linkedin_images_batch] Failed url=%s", raw_url)
-            entry["error"] = str(e)
-
-        results.append(entry)
-
+    results = ordered
     succeeded = [r for r in results if r["ok"]]
     media_ids = [r["mediaId"] for r in succeeded if r.get("mediaId")]
     clean_urls = [r["cleanUrl"] for r in succeeded if r.get("cleanUrl")]
@@ -595,8 +663,8 @@ def process_linkedin_images_batch(
         "processed": len(succeeded),
         "failed": len(results) - len(succeeded),
         "featuredMediaId": media_ids[0] if media_ids else None,
-        "galleryIds": media_ids[1:],
-        "allMediaIds": media_ids,
+        "galleryIds": media_ids,      # IMPROVEMENT #1: featured INCLUDED, never empty
+        "allMediaIds": media_ids,     # kept for back-compat
         "cleanUrls": clean_urls,
         "results": results,
     }
