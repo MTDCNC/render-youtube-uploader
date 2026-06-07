@@ -23,6 +23,10 @@ PROCESSED_DIR = os.environ.get("PROCESSED_IMAGES_DIR", "processed_images")
 SIDELOAD_CONCURRENCY = int(os.environ.get("WP_SIDELOAD_CONCURRENCY", 4))
 MAX_IMAGES_PER_POST = int(os.environ.get("MAX_IMAGES_PER_POST", 10))
 SIDELOAD_RETRIES = int(os.environ.get("WP_SIDELOAD_RETRIES", 2))
+# When true, check the WP media library for an existing attachment with the
+# same (deterministic) filename before uploading, and reuse it if found.
+# Makes uploads idempotent so retries/replays cannot create duplicates.
+WP_DEDUPE_BY_FILENAME = os.environ.get("WP_DEDUPE_BY_FILENAME", "true").lower() == "true"
 
 
 # ---------- Helpers ----------
@@ -490,6 +494,55 @@ def _wp_credentials() -> Tuple[str, Tuple[str, str]]:
     return endpoint, (user, app_password)
 
 
+def _find_existing_wp_media(filename: str, timeout: int = 15) -> Optional[int]:
+    """Return the media ID of an existing attachment whose stored filename
+    matches `filename` exactly, or None.
+
+    Idempotency key: our filenames are deterministic (same post+image -> same
+    name every run), so a prior successful upload can be reused instead of
+    creating a duplicate. WordPress does NOT dedupe on filename itself (it
+    appends -1/-2 and makes a new attachment), so we check explicitly.
+
+    Matching is EXACT against media_details.file (the stored path, e.g.
+    '2026/06/grob-..._3.jpg') to avoid WP's fuzzy slug search returning a
+    near-name from a different post.
+    """
+    endpoint, auth = _wp_credentials()
+
+    # filename without extension is what WP's ?search matches on (the slug)
+    stem = filename.rsplit(".", 1)[0]
+    try:
+        resp = requests.get(
+            endpoint,
+            auth=auth,
+            params={"search": stem, "per_page": 100, "media_type": "image"},
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            logger.warning(
+                "[_find_existing_wp_media] lookup HTTP %s for %s - treating as not-found",
+                resp.status_code, filename,
+            )
+            return None
+
+        for item in resp.json():
+            details = (item.get("media_details") or {})
+            stored = details.get("file", "")          # e.g. '2026/06/grob-..._3.jpg'
+            stored_name = stored.rsplit("/", 1)[-1]    # -> 'grob-..._3.jpg'
+            slug = item.get("slug", "")
+            if stored_name == filename or slug == stem:
+                logger.info(
+                    "[_find_existing_wp_media] HIT media_id=%s for %s (skip re-upload)",
+                    item.get("id"), filename,
+                )
+                return item.get("id")
+        return None
+    except Exception as e:
+        # Never let the idempotency check break the pipeline; fall back to upload.
+        logger.warning("[_find_existing_wp_media] lookup failed for %s: %s", filename, e)
+        return None
+
+
 def sideload_image_to_wordpress(local_path: str, filename: str, timeout: int = 60) -> int:
     """
     Upload a processed image file from disk into the WordPress media library.
@@ -505,6 +558,13 @@ def sideload_image_to_wordpress(local_path: str, filename: str, timeout: int = 6
     separate hardening if you ever need it.
     """
     endpoint, auth = _wp_credentials()
+
+    # Idempotency: if this exact filename is already in the media library
+    # (a prior run / a Zapier retry), reuse it instead of creating a duplicate.
+    if WP_DEDUPE_BY_FILENAME:
+        existing = _find_existing_wp_media(filename)
+        if existing:
+            return existing
 
     with open(local_path, "rb") as f:
         file_bytes = f.read()
