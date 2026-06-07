@@ -55,6 +55,11 @@ except Exception:
     pass
 
 
+BASE_PUBLIC_URL = os.environ.get(
+    "BASE_PUBLIC_URL",
+    "https://render-youtube-uploader.onrender.com",
+)
+
 # ---------------- tiny utils ----------------
 def iso_now():
     return datetime.utcnow().isoformat() + "Z"
