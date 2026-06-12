@@ -152,7 +152,7 @@ def select_channel_by_location(location: str) -> str:
             canon.add("UK")
         elif p == "north america":
             canon.add("US")
-        elif p in ["north america (spanish)", "espanol"]:
+        elif p in ["north america (spanish)", "espanol", "south america"]:
             canon.add("ES")
         elif p == "asia":
             canon.add("Asia")
