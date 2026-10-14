@@ -26,6 +26,7 @@ from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 from google.auth.transport.requests import Request
 from zoneinfo import ZoneInfo  # Py3.9+
 import re
@@ -219,6 +220,33 @@ def streamed_download(url: str, dest_path: str, log_prefix: str, chunk=1_048_576
     app.logger.info(f"{log_prefix} download complete -> {dest_path}")
 
 # ---------------- YouTube worker ----------------
+def set_youtube_thumbnail(yt, video_id, path, job_id, delays=(0, 15, 30, 60)):
+    """thumbnails.set with retries. YouTube sometimes answers 403/5xx for a few seconds after an
+    upload finishes (seen 13-14 Oct 2026), so retry those; give up straight away on other 4xx.
+    Returns (ok, error_text)."""
+    with open(path, "rb") as f:
+        head = f.read(8)
+    mime = "image/png" if head[:4] == bytes([0x89, 0x50, 0x4E, 0x47]) else "image/jpeg"
+    size = os.path.getsize(path)
+    last = None
+    for attempt, delay in enumerate(delays, 1):
+        if delay:
+            time.sleep(delay)
+        try:
+            yt.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(path, mimetype=mime)).execute()
+            jlog("yt.thumb.set", job_id=job_id, attempt=attempt, mime=mime, bytes=size)
+            return True, None
+        except HttpError as e:
+            last = str(e)
+            jlog("yt.thumb.retry", job_id=job_id, attempt=attempt, status=e.resp.status, mime=mime, bytes=size)
+            if e.resp.status not in (403, 404, 429, 500, 502, 503, 504):
+                break
+        except Exception as e:
+            last = str(e)
+            jlog("yt.thumb.retry", job_id=job_id, attempt=attempt, reason=last[:200])
+    return False, last
+
+
 def async_upload_to_youtube(job_id, video_url, title, description, privacy, thumbnail_url, bunny_delete_url, raw_tags, channel_key, publish_at=None):
     filename = None
     try:
@@ -279,20 +307,26 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
         app.logger.info(f"[{job_id}] YT done -> {url}")
         jlog("yt.done", job_id=job_id, filename=filename, video_id=vid, youtube_url=url)
 
-        # Thumbnail (non-fatal)
+        # Thumbnail (non-fatal, but the outcome is recorded in the job status)
+        thumb_state, thumb_error = "none", None
         if thumbnail_url:
+            thf = f"yt_thumb_{job_id}.jpg"
             try:
-                thf = f"yt_thumb_{job_id}.jpg"
                 streamed_download(thumbnail_url, thf, f"[{job_id}] thumb",
                                   on_progress=lambda p: jlog("yt.thumb.download.progress", job_id=job_id, pct=p))
-                yt.thumbnails().set(videoId=vid, media_body=MediaFileUpload(thf, mimetype="image/jpeg")).execute()
+                ok, thumb_error = set_youtube_thumbnail(yt, vid, thf, job_id)
+                thumb_state = "set" if ok else "failed"
+            except Exception as e:
+                thumb_state, thumb_error = "failed", str(e)
+            finally:
                 try: os.remove(thf)
-                except: pass
+                except Exception: pass
+            if thumb_state == "set":
                 app.logger.info(f"[{job_id}] YT thumbnail set")
                 jlog("yt.thumb.done", job_id=job_id)
-            except Exception as e:
-                app.logger.warning(f"[{job_id}] YT thumbnail error: {e}")
-                jlog("yt.thumb.error", job_id=job_id, reason=str(e))
+            else:
+                app.logger.warning(f"[{job_id}] YT thumbnail error: {thumb_error}")
+                jlog("yt.thumb.error", job_id=job_id, reason=str(thumb_error))
 
         try:
             os.remove(tmp)
@@ -314,7 +348,8 @@ def async_upload_to_youtube(job_id, video_url, title, description, privacy, thum
 
         # Write status file with success
         st = read_json(YT_STATUS_FILE, dict)
-        st[job_id] = {"state":"completed","youtube_url":url,"finished_at":iso_now(),"channel":channel_key,"source_filename":filename}
+        st[job_id] = {"state":"completed","youtube_url":url,"finished_at":iso_now(),"channel":channel_key,"source_filename":filename,
+                    "thumbnail":thumb_state,"thumbnail_error":(str(thumb_error)[:300] if thumb_error else None)}
         write_json(YT_STATUS_FILE, st)
         jlog("yt.final", job_id=job_id, filename=filename, status="success", youtube_url=url)
 
