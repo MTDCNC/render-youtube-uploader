@@ -136,10 +136,13 @@ def parse_publish_at_uk(s: str) -> datetime:
 
 def select_channel_by_location(location: str) -> str:
     """
-    Priority: UK → US → Spain → Asia
+    Which YouTube channel a video goes to. Only two exist for uploads: UK (main) and Spain.
+    Priority: UK / North America (main) -> Spain -> default (main)
+    - North America and Asia videos go to the MAIN channel (no separate US / Asia uploads).
+    - Spanish videos ("North America (Spanish)", "Espanol", "South America") go to the Spanish channel.
     - Exact values come from Monday.com dropdowns.
     - Supports multi-select strings (comma/newline separated).
-    - Default: UK if nothing relevant is selected.
+    - Default: UK (main) if nothing relevant is selected.
     """
     text = (location or "").strip().lower()
 
@@ -149,27 +152,19 @@ def select_channel_by_location(location: str) -> str:
     # Normalise to canonical tokens
     canon = set()
     for p in parts:
-        if p == "united kingdom":
+        if p in ["united kingdom", "north america"]:
             canon.add("UK")
-        elif p == "north america":
-            canon.add("US")
         elif p in ["north america (spanish)", "espanol", "south america"]:
             canon.add("ES")
-        elif p == "asia":
-            canon.add("Asia")
-        # Europe, Middle East, South America → ignored (fall through to default)
+        # Asia, Europe, Middle East -> ignored (fall through to default, i.e. main channel)
 
-    # Priority: UK → US → Spain → Asia
+    # Priority: UK / North America -> Spain
     if "UK" in canon:
         return "UK"
-    if "US" in canon:
-        return "US"
     if "ES" in canon:
         return "Spain"
-    if "Asia" in canon:
-        return "Asia"
 
-    # Default if only Europe/Middle East/South America/empty/etc.
+    # Default (main channel) if only Asia/Europe/Middle East/empty/etc.
     return "UK"
 
 
