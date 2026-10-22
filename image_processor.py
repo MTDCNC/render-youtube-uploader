@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Tuple, Dict, Any, Optional
 
 import requests
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 logger = logging.getLogger("image_processor")
 
@@ -146,68 +146,112 @@ def calculate_target_dimensions(
 
 # ---------- Core image processing ----------
 
-def process_image_bytes(
-    image_bytes: bytes,
-    target_size: Tuple[int, int],
-    max_filesize: int = DEFAULT_MAX_FILESIZE,
-) -> Tuple[bytes, Tuple[int, int], int]:
-    """
-    Resize and JPEG-compress an image to target_size and under max_filesize.
-    Returns (processed_bytes, final_size_tuple, final_filesize_bytes).
-    """
-    start = time.time()
-    img = Image.open(io.BytesIO(image_bytes))
-    img = img.convert("RGB")
+# ---------- 16:9 conform (LinkedIn images) ----------
+#
+# Website tiles and email templates show images in a 640x360 container, so a
+# portrait LinkedIn image used to get its head/feet cropped by the browser.
+# Every LinkedIn image now leaves here as 16:9:
+#   - narrow (portrait, square, 4:3, 4:5): blurred, darkened copy fills the
+#     frame, the sharp image sits full height in the centre with a soft shadow
+#   - 3:2 and wider: centre-cropped to 16:9
+# Same rules as Scripts_and_Tools/Python_Scripts/Web_Image_16x9/make_web_16x9.py
 
-    orig_size = img.size
-    logger.info(
-        "[process_image] Opened image, original size=%sx%s, mode=%s",
-        orig_size[0],
-        orig_size[1],
-        img.mode,
-    )
+CROP_MIN_ASPECT = float(os.environ.get("IMG_CROP_MIN_ASPECT", 1.5))
+MIN_FRONT_ASPECT = float(os.environ.get("IMG_MIN_FRONT_ASPECT", 9 / 16))
+BG_BLUR = 0.035          # rear blur radius as a fraction of canvas height
+BG_BRIGHTNESS = 0.85
+SHADOW_BLUR = 0.018
+SHADOW_OFFSET = 0.006
+SHADOW_OPACITY = 0.45
 
-    target_w, target_h = target_size
-    logger.info(
-        "[process_image] Calculated dimensions %sx%s from original %sx%s",
-        target_w,
-        target_h,
-        orig_size[0],
-        orig_size[1],
-    )
+COMMON_RATIOS = [(1, 1), (4, 5), (5, 4), (3, 4), (4, 3), (2, 3), (3, 2), (9, 16), (16, 9),
+                 (1, 2), (2, 1), (21, 9)]
 
-    img = img.resize((target_w, target_h), Image.LANCZOS)
-    qualities = [85, 80, 75, 70, 65, 60, 55, 50]
 
-    final_bytes: Optional[bytes] = None
-    final_filesize = 0
+def ratio_label(w: int, h: int) -> str:
+    """Source ratio for filenames: nearest common ratio within 1%, else e.g. 0.71x1."""
+    r = w / h
+    a, b = min(COMMON_RATIOS, key=lambda ab: abs(ab[0] / ab[1] - r))
+    if abs(a / b - r) / r <= 0.01:
+        return f"{a}x{b}"
+    return f"{r:.2f}x1"
 
-    for idx, q in enumerate(qualities, start=1):
+
+def _cover(img: Image.Image, w: int, h: int, y_bias: float = 0.5) -> Image.Image:
+    """Scale to cover w x h and crop the overflow (y_bias 0 = keep top, 0.5 = centre)."""
+    s = max(w / img.width, h / img.height)
+    rw, rh = max(w, round(img.width * s)), max(h, round(img.height * s))
+    img = img.resize((rw, rh), Image.LANCZOS)
+    x = (rw - w) // 2
+    y = round((rh - h) * y_bias)
+    return img.crop((x, y, x + w, y + h))
+
+
+def conform_16x9(
+    img: Image.Image,
+    max_container_width: int = DEFAULT_MAX_CONTAINER_WIDTH,
+    max_container_height: int = DEFAULT_MAX_CONTAINER_HEIGHT,
+    min_width: int = DEFAULT_MIN_WIDTH,
+) -> Tuple[Image.Image, Dict[str, Any]]:
+    """Return (16:9 RGB image, container_info). Never upscales past the source
+    except to reach min_width."""
+    target = max_container_width / max_container_height
+    min_h = round(min_width / target)
+
+    def canvas(h):
+        h = max(min_h, min(max_container_height, h))
+        return round(h * target), h
+
+    src_w, src_h = img.size
+    aspect = src_w / src_h
+    if aspect >= CROP_MIN_ASPECT:
+        W, H = canvas(min(img.height, round(img.width / target)))
+        out, fit_type = _cover(img, W, H), "crop-16x9"
+    else:
+        if aspect < MIN_FRONT_ASPECT - 0.005:
+            # Too narrow to read at thumbnail size: trim height, keeping 30/70 top/bottom
+            keep_h = round(img.width / MIN_FRONT_ASPECT)
+            top = round((img.height - keep_h) * 0.3)
+            img = img.crop((0, top, img.width, top + keep_h))
+        W, H = canvas(img.height)
+        fw = round(H * img.width / img.height)
+
+        out = _cover(img, W, H).filter(ImageFilter.GaussianBlur(H * BG_BLUR))
+        out = ImageEnhance.Brightness(out).enhance(BG_BRIGHTNESS)
+
+        x = (W - fw) // 2
+        dy = round(H * SHADOW_OFFSET)
+        shadow = Image.new("L", (W, H), 0)
+        shadow.paste(round(255 * SHADOW_OPACITY), (x, dy, x + fw, H + dy))
+        shadow = shadow.filter(ImageFilter.GaussianBlur(H * SHADOW_BLUR))
+        out.paste(Image.new("RGB", (W, H), "black"), mask=shadow)
+
+        out.paste(img.resize((fw, H), Image.LANCZOS), (x, 0))
+        fit_type = "blur-composite-16x9"
+
+    info = {
+        "aspect_ratio": round(aspect, 4),
+        "source_ratio": ratio_label(src_w, src_h),
+        "container_aspect": round(target, 4),
+        "fit_type": fit_type,
+        "max_container": [max_container_width, max_container_height],
+        "min_width": min_width,
+    }
+    logger.info("[conform_16x9] %sx%s -> %sx%s %s", src_w, src_h, out.width, out.height, fit_type)
+    return out, info
+
+
+def encode_jpeg(img: Image.Image, max_filesize: int = DEFAULT_MAX_FILESIZE) -> bytes:
+    """JPEG at the highest quality from 85 down to 50 that fits max_filesize."""
+    data = b""
+    for q in (85, 80, 75, 70, 65, 60, 55, 50):
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=q, optimize=True)
-        final_bytes = buf.getvalue()
-        final_filesize = len(final_bytes)
-
-        logger.info(
-            "[process_image] Iteration %s: quality=%s size=%s bytes",
-            idx,
-            q,
-            final_filesize,
-        )
-
-        if final_filesize <= max_filesize or q == qualities[-1]:
+        img.save(buf, format="JPEG", quality=q, optimize=True, progressive=True)
+        data = buf.getvalue()
+        logger.info("[encode_jpeg] quality=%s size=%s bytes", q, len(data))
+        if len(data) <= max_filesize:
             break
-
-    elapsed = time.time() - start
-    logger.info(
-        "[process_image] Completed processing in %.2fs; final size=%s bytes, %sx%s",
-        elapsed,
-        final_filesize,
-        target_w,
-        target_h,
-    )
-
-    return final_bytes, (target_w, target_h), final_filesize
+    return data
 
 
 # ---------- High-level orchestration ----------
@@ -226,20 +270,20 @@ def process_linkedin_image(
     """
     High-level helper used by Flask route.
     - Downloads the LinkedIn image.
-    - Calculates container-aware resize dimensions.
-    - Resizes & compresses under max_filesize.
-    - Saves to disk in output_dir.
+    - Conforms it to 16:9 (blur composite or crop, see conform_16x9).
+    - Compresses under max_filesize.
+    - Saves to disk in output_dir as <filename>_<source ratio>.jpg.
     - Returns a dict suitable for JSON response.
     """
     total_start = time.time()
-    safe_filename = sanitize_filename(filename)
-    if not safe_filename.lower().endswith(".jpg"):
-        safe_filename += ".jpg"
+    stem = sanitize_filename(filename)
+    if stem.lower().endswith(".jpg"):
+        stem = stem[:-4]
 
     logger.info(
         "[process_linkedin_image] Start for url=%s filename=%s",
         url,
-        safe_filename,
+        stem,
     )
 
     ensure_output_dir(output_dir)
@@ -247,24 +291,31 @@ def process_linkedin_image(
     # 1) Download
     img_bytes, download_meta = download_linkedin_image(url)
 
-    # 2) Open just to read original size
+    # 2) Open, honour EXIF orientation, flatten any transparency onto white
     with Image.open(io.BytesIO(img_bytes)) as tmp:
-        orig_w, orig_h = tmp.size
+        img = ImageOps.exif_transpose(tmp)
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGBA")
+            flat = Image.new("RGB", img.size, (255, 255, 255))
+            flat.paste(img, mask=img.getchannel("A"))
+            img = flat
+        else:
+            img = img.convert("RGB")
+    orig_w, orig_h = img.size
 
-    # 3) Calculate target size
-    target_size, container_info = calculate_target_dimensions(
-        (orig_w, orig_h),
+    # 3) Conform to 16:9
+    conformed, container_info = conform_16x9(
+        img,
         max_container_width=max_container_width,
         max_container_height=max_container_height,
         min_width=min_width,
     )
+    target_size = processed_size = conformed.size
+    safe_filename = f"{stem}_{container_info['source_ratio']}.jpg"
 
-    # 4) Process image
-    processed_bytes, processed_size, file_size = process_image_bytes(
-        img_bytes,
-        target_size,
-        max_filesize=max_filesize,
-    )
+    # 4) Compress
+    processed_bytes = encode_jpeg(conformed, max_filesize)
+    file_size = len(processed_bytes)
 
     # 5) Save to disk
     local_dir = ensure_output_dir(output_dir)
